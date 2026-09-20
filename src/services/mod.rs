@@ -118,12 +118,6 @@ pub fn validate_answers(
         ensure!(
             probabilities
                 .values()
-                .all(|p| *p <= probabilities[selected] + 1e-9),
-            "Jev selected choice is not a maximum probability alternative"
-        );
-        ensure!(
-            probabilities
-                .values()
                 .all(|p| p.is_finite() && (0.0..=1.0).contains(p)),
             "Jev probabilities out of range"
         );
@@ -173,6 +167,13 @@ pub async fn score_session(session: &Session, config: &Config) -> Result<Analysi
         let response = transport::post(&client, &config.jev.endpoint, &key, &request).await?;
         let validated = validate_answers(&request, &response)?;
         for (question, distribution) in &validated {
+            if let Some((alternative, probability)) = distribution.higher_probability_alternative()
+            {
+                warnings.push(format!(
+                    "Jev selected choice for {question}: {} (probability={:.8}) is not a maximum probability alternative; {alternative} has probability={probability:.8}; original choice and probabilities preserved",
+                    distribution.selected, distribution.confidence()
+                ));
+            }
             let sum = distribution.probabilities.values().sum::<f64>();
             if (sum - 1.0).abs() > 0.001 + 1e-9 {
                 warnings.push(format!(

@@ -289,7 +289,12 @@ fn collect_refs(value: &Value, parent: Option<&str>, refs: &mut BTreeSet<(String
 pub async fn review(evidence: &Value, config: &Config) -> Result<Value> {
     ensure!(
         config.review.provider != "none",
-        "Review provider is not configured"
+        "Review provider is not configured (review.provider is \"none\"). \
+         Edit the workspace's .jta/config.json: set review.provider to \"openai\" or \"openrouter\" \
+         and configure review.endpoint, review.model, and review.api_key_env for that provider. \
+         Set the API key in the shell environment or workspace .env. \
+         Rerunning jta init does not update an existing configuration. \
+         Use jta review --dry-run to preview without sending a request."
     );
     let mut request = prepare_review(evidence, config)?;
     let key = transport::credential(&config.review.api_key_env)?;

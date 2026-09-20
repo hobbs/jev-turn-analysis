@@ -517,6 +517,10 @@ Retention defaults to 90 days and can be set with `jta init --retention-days`. `
 
 Jev retains the full probability distribution for each categorical question. The CLI normally displays the selected answer and its probability; JSON output includes all alternatives. Probabilities are model estimates whose reliability can be checked against human labels.
 
+If Jev selects an option below the highest reported probability, analysis preserves
+the original answer and records a warning with the question and conflicting
+probabilities. Affected turns are also marked inconsistent for review.
+
 Session questions:
 
 | Question | Answers |
@@ -619,6 +623,17 @@ or `--review-provider openrouter` (defaults to `OPENROUTER_API_KEY` and model
 `openai/gpt-4.1`). For an existing workspace, edit the `review` object in
 `.jta/config.json`; rerunning `init` does not change it. Endpoint, model, and
 key-variable flags can override defaults when initializing.
+
+If `jta review` reports `Review provider is not configured`, the existing
+workspace still has `review.provider` set to `"none"`. For OpenAI, change that
+field to `"openai"` and set `OPENAI_API_KEY` in the workspace's `.env` or shell;
+the other default review settings above already target OpenAI. For OpenRouter,
+set the review provider to `"openrouter"`, endpoint to
+`"https://openrouter.ai/api/v1/chat/completions"`, model to `"openai/gpt-4.1"`, and
+api_key_env to `"OPENROUTER_API_KEY"`, then set that key in `.env` or the shell.
+Preserve the other configuration fields. Run `jta review --dry-run` to inspect
+the destination and request, then `jta review` to send it.
+
 Custom redaction patterns are regular expressions. Matching values use stable hashed
 placeholders. Review the dry-run payload before sharing confidential transcripts;
 automatic redaction cannot identify every secret or sensitive passage.

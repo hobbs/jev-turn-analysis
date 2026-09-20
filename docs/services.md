@@ -12,14 +12,21 @@ questions, one downstream candidate selection, and eleven independent yes/no
 opportunity questions. Secondary opportunities are supported yes answers excluding
 the selected primary category. All distributions, including secondary and
 downstream questions, are retained. Missing categories, extra categories, invalid
-probabilities, sums outside the rounding tolerance, invalid selections, and incomplete
+probabilities, sums outside the rounding tolerance, unknown selections, and incomplete
 responses fail the analysis rather than inventing a judgment. The sum tolerance is
 0.001 for higher-precision distributions. When every probability is rounded to
 hundredths, as observed in live Jev responses, the tolerance is 0.005 per option
 (the maximum cumulative rounding error). All-zero distributions are rejected.
 Original probabilities are preserved; accepted sums differing from one by more
 than 0.001 produce analysis warnings. Sum errors identify the question, total, and
-tolerance. `confidence()` is
+tolerance. The API documents `choice` as the highest-probability option, but live
+responses can disagree with their reported distributions. Such disagreements
+produce analysis warnings identifying the question, selected option, and a
+highest-probability alternative with both probabilities; turn answers also receive
+an inconsistency marker. The original selection and probabilities are preserved
+instead of rejecting the entire session or substituting a different judgment.
+Ties and floating-point differences within 1e-9 do not trigger warnings.
+`confidence()` is
 the selected category's probability; `provider_confidence` separately preserves
 [Jev's confidence measure](https://docs.typesafe.ai/confidence).
 

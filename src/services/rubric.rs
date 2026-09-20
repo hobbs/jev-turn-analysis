@@ -128,6 +128,11 @@ pub fn inconsistencies(answers: &BTreeMap<String, Distribution>) -> Vec<String> 
         result.push("No primary opportunity but secondary opportunity supported".into());
     }
     for (name, d) in answers {
+        if d.higher_probability_alternative().is_some() {
+            result.push(format!(
+                "Selected choice is not a maximum probability alternative: {name}"
+            ));
+        }
         let mut ps: Vec<_> = d.probabilities.values().copied().collect();
         ps.sort_by(|a, b| b.total_cmp(a));
         if d.confidence() < 0.6 || ps.get(1).is_some_and(|second| ps[0] - second < 0.15) {

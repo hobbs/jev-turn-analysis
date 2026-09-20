@@ -689,7 +689,12 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                     json!({"recommendations":[],"message":"No readable project files available to ground recommendations. Restore the selected project or supply --context <file>. No LLM request sent."}),
                 )?;
             } else {
-                let result = services::review(&evidence, &c).await?;
+                let result = services::review(&evidence, &c).await.with_context(|| {
+                    format!(
+                        "Review failed using configuration {}",
+                        w.data_dir().join("config.json").display()
+                    )
+                })?;
                 let mut saved = vec![];
                 let mut skipped = vec![];
                 let mut warnings = vec![];

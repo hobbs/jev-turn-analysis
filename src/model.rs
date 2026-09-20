@@ -70,6 +70,14 @@ pub struct Distribution {
     pub probabilities: BTreeMap<String, f64>,
 }
 impl Distribution {
+    pub(crate) fn higher_probability_alternative(&self) -> Option<(&str, f64)> {
+        self.probabilities
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .filter(|(_, probability)| **probability > self.confidence() + 1e-9)
+            .map(|(alternative, probability)| (alternative.as_str(), *probability))
+    }
+
     pub fn confidence(&self) -> f64 {
         self.probabilities
             .get(&self.selected)

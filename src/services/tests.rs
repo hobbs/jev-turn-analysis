@@ -96,6 +96,96 @@ fn rejects_missing_and_invalid_probabilities() {
     assert!(validate_answers(&request, &bad).is_err());
 }
 #[test]
+fn non_maximum_choices_preserve_provider_values() {
+    let request = json!({"questions":{"q":{"criteria":{"a":null,"b":null}}}});
+    for (a, b, mismatch) in [
+        (0.2, 0.8, true),
+        (0.0, 1.0, true),
+        (0.5, 0.5, false),
+        (0.4999999999, 0.5000000001, false),
+        (0.8, 0.2, false),
+    ] {
+        let response = json!({"model":"jev-test","answers":{"q":{
+            "type":"choice","choice":"a","confidence":0.75,
+            "probabilities":{"a":a,"b":b}
+        }}});
+        let validated = validate_answers(&request, &response).unwrap();
+        let distribution = &validated["q"];
+        assert_eq!(distribution.selected, "a");
+        assert_eq!(distribution.confidence(), a);
+        assert_eq!(distribution.provider_confidence, Some(0.75));
+        assert_eq!(
+            serde_json::to_value(&distribution.probabilities).unwrap(),
+            response["answers"]["q"]["probabilities"]
+        );
+        assert_eq!(
+            distribution.higher_probability_alternative().is_some(),
+            mismatch
+        );
+        assert_eq!(
+            rubric::inconsistencies(&validated)
+                .iter()
+                .any(|s| s.contains("not a maximum")),
+            mismatch
+        );
+
+        let mut unknown = response.clone();
+        unknown["answers"]["q"]["choice"] = json!("unknown");
+        assert!(validate_answers(&request, &unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown alternative"));
+    }
+}
+#[tokio::test]
+async fn scoring_preserves_non_maximum_choices_and_records_warnings() {
+    let mut config = Config::default();
+    config.jev.api_key_env = "JTA_CHOICE_MISMATCH_TEST_KEY".into();
+    std::env::set_var(&config.jev.api_key_env, "test-key");
+    let session = fixture();
+    let request = prepare_analysis(&session, &config).unwrap().remove(0);
+    let mut response = answer(&request);
+    let keys = ["session.outcome_verification", "turn.1.usefulness"];
+    for key in keys {
+        let answer = &mut response["answers"][key];
+        // Keep the complete distribution, but select an option with probability zero.
+        answer["choice"] = json!(
+            answer["probabilities"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, p)| p.as_f64() == Some(0.0))
+                .unwrap()
+                .0
+        );
+    }
+    let expected = validate_answers(&request, &response).unwrap();
+    let (url, handle) = server(vec![(200, response)]);
+    config.jev.endpoint = url;
+    let analysis = score_session(&session, &config).await.unwrap();
+    assert_eq!(analysis.warnings.len(), 2);
+    for (key, distribution) in [
+        (keys[0], &analysis.session["outcome_verification"]),
+        (keys[1], &analysis.turns[&1].answers["usefulness"]),
+    ] {
+        assert_eq!(
+            serde_json::to_value(distribution).unwrap(),
+            serde_json::to_value(&expected[key]).unwrap()
+        );
+        let warning = analysis.warnings.iter().find(|w| w.contains(key)).unwrap();
+        assert!(warning.contains(&distribution.selected));
+        assert!(warning.contains("probability=0.00000000"));
+        assert!(warning.contains("probability=1.00000000"));
+        assert!(warning.contains("original choice and probabilities preserved"));
+    }
+    assert!(analysis.turns[&1]
+        .inconsistencies
+        .iter()
+        .any(|s| s == "Selected choice is not a maximum probability alternative: usefulness"));
+    assert_eq!(handle.join().unwrap().len(), 1);
+    std::env::remove_var(&config.jev.api_key_env);
+}
+#[test]
 fn rounded_probability_sums_preserve_provider_values() {
     let request = json!({"questions":{"session.outcome_verification":{"criteria":{
         "claimed_but_unverified":null,"known_incomplete":null,"unclear":null,"verified":null

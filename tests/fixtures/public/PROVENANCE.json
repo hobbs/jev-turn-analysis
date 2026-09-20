@@ -1,0 +1,75 @@
+[
+  {
+    "file": "claude-4c09dfa9-ff25-4b4c-a2d0-d2fd702c64ee.jsonl",
+    "dataset": "trace-commons/agent-traces",
+    "revision": "112ebd4d03ce852b00e935d523107c3d0c9a65bf",
+    "source_url": "https://huggingface.co/datasets/trace-commons/agent-traces/resolve/112ebd4d03ce852b00e935d523107c3d0c9a65bf/sessions/claude_code/4c09dfa9-ff25-4b4c-a2d0-d2fd702c64ee.jsonl",
+    "license": "CC-BY-4.0",
+    "sha256": "137dd4872992c3a1b4d6460962a6d5b2578141511af97bc291039dd6e3b5ea6f",
+    "bytes": 39347,
+    "transformation": "none"
+  },
+  {
+    "file": "claude-674e0f5c-c481-4830-b2ef-3e1e069a2b7f.jsonl",
+    "dataset": "trace-commons/agent-traces",
+    "revision": "112ebd4d03ce852b00e935d523107c3d0c9a65bf",
+    "source_url": "https://huggingface.co/datasets/trace-commons/agent-traces/resolve/112ebd4d03ce852b00e935d523107c3d0c9a65bf/sessions/claude_code/674e0f5c-c481-4830-b2ef-3e1e069a2b7f.jsonl",
+    "license": "CC-BY-4.0",
+    "sha256": "a75a42565e266910d87aa637001b2ac0a523c22db09811865a849ab2da7f9197",
+    "bytes": 74956,
+    "transformation": "none"
+  },
+  {
+    "file": "claude-11ef2190-67e2-4707-8212-ab12ebffdbc2.jsonl",
+    "dataset": "trace-commons/agent-traces",
+    "revision": "112ebd4d03ce852b00e935d523107c3d0c9a65bf",
+    "source_url": "https://huggingface.co/datasets/trace-commons/agent-traces/resolve/112ebd4d03ce852b00e935d523107c3d0c9a65bf/sessions/claude_code/11ef2190-67e2-4707-8212-ab12ebffdbc2.jsonl",
+    "license": "CC-BY-4.0",
+    "sha256": "98a1ff2f95f84fac563e6e55689a7fbb7eb9a6e1e19598dd8dffa54f3332d1b1",
+    "bytes": 132969,
+    "transformation": "none"
+  },
+  {
+    "file": "claude-da6566ff-0116-4424-bb59-660623f9eb31.jsonl",
+    "dataset": "trace-commons/agent-traces",
+    "revision": "112ebd4d03ce852b00e935d523107c3d0c9a65bf",
+    "source_url": "https://huggingface.co/datasets/trace-commons/agent-traces/resolve/112ebd4d03ce852b00e935d523107c3d0c9a65bf/sessions/claude_code/da6566ff-0116-4424-bb59-660623f9eb31.jsonl",
+    "license": "CC-BY-4.0",
+    "sha256": "78a3becc8ffcd5a655f7c48cd4ba62d104cea1693e075f2b2685a0661dbb9955",
+    "bytes": 122727,
+    "transformation": "none"
+  },
+  {
+    "file": "share-codex-019a01de-5671-7df2-ba26-40d73f132ea7.json",
+    "dataset": "nmuendler/share-codex",
+    "revision": "368d63924356a773add5fe73f31ec014642ed0f1",
+    "source_url": "https://huggingface.co/datasets/nmuendler/share-codex/resolve/368d63924356a773add5fe73f31ec014642ed0f1/train.jsonl",
+    "source_record_index": 8,
+    "license": "CC-BY-4.0 dataset; source code retains original license in metadata",
+    "sha256": "75708bac3ec1685a2007133ad2c1c61c46b2ff507ec32e50a7542843cb052d20",
+    "bytes": 11758,
+    "transformation": "one complete session record selected from dataset JSONL"
+  },
+  {
+    "file": "share-codex-019a0204-2db1-70f0-b247-8aaa860a6b7c.json",
+    "dataset": "nmuendler/share-codex",
+    "revision": "368d63924356a773add5fe73f31ec014642ed0f1",
+    "source_url": "https://huggingface.co/datasets/nmuendler/share-codex/resolve/368d63924356a773add5fe73f31ec014642ed0f1/train.jsonl",
+    "source_record_index": 11,
+    "license": "CC-BY-4.0 dataset; source code retains original license in metadata",
+    "sha256": "13e3aaf7b915d572bea261a2c14443a3a5eac83f33680abf9c0e213cd3726a51",
+    "bytes": 18562,
+    "transformation": "one complete session record selected from dataset JSONL"
+  },
+  {
+    "file": "share-codex-019a0605-8197-7cd1-af56-442f28250c0f.json",
+    "dataset": "nmuendler/share-codex",
+    "revision": "368d63924356a773add5fe73f31ec014642ed0f1",
+    "source_url": "https://huggingface.co/datasets/nmuendler/share-codex/resolve/368d63924356a773add5fe73f31ec014642ed0f1/train.jsonl",
+    "source_record_index": 16,
+    "license": "CC-BY-4.0 dataset; source code retains original license in metadata",
+    "sha256": "cb8ef7165e89b1f84354b1e093e403804ed09e49bbde8e49a9f78d7fee19b785",
+    "bytes": 21311,
+    "transformation": "one complete session record selected from dataset JSONL"
+  }
+]

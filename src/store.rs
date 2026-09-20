@@ -13,6 +13,7 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub root: PathBuf,
+    data: PathBuf,
 }
 fn safe(value: &str) -> Result<()> {
     if value.is_empty()
@@ -39,39 +40,69 @@ fn atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 impl Workspace {
     pub fn init(root: &Path, config: &Config) -> Result<Self> {
         fs::create_dir_all(root)?;
+        let root = root.canonicalize()?;
         let ws = Self {
-            root: root.canonicalize()?,
+            data: root.join(".jta"),
+            root,
         };
         if !ws.data_dir().join("config.json").exists() {
             atomic(&ws.data_dir().join("config.json"), config)?;
         }
         Ok(ws)
     }
+    /// Resolve the per-project user directory without creating anything.
+    pub fn for_project(project: &Path) -> Result<Self> {
+        let start = project.canonicalize().context("project path not found")?;
+        let root = crate::discovery::resolve_project(&start)?;
+        let home = crate::config::data_home()?;
+        let name = root.file_name().unwrap_or_default().to_string_lossy();
+        let digest = crate::config::hash(root.to_string_lossy().as_bytes());
+        let data = home
+            .join("projects")
+            .join(format!("{name}-{}", &digest[..16]));
+        Ok(Self { root, data })
+    }
+    pub fn open_or_init(explicit: Option<&Path>, project: &Path) -> Result<Self> {
+        if let Some(path) = explicit {
+            return Self::init(path, &Config::default());
+        }
+        let ws = Self::for_project(project)?;
+        if !ws.data_dir().join("config.json").exists() {
+            ws.save_config(&Config::default())?;
+        }
+        Ok(ws)
+    }
     pub fn discover(explicit: Option<&Path>) -> Result<Self> {
-        let start = explicit
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_dir()?);
-        let start = start.canonicalize().context("workspace path not found")?;
-        if explicit.is_some() {
-            if start.join(".jta/config.json").exists() {
-                return Ok(Self { root: start });
+        let ws = if let Some(path) = explicit {
+            let root = path.canonicalize().context("workspace path not found")?;
+            Self {
+                data: root.join(".jta"),
+                root,
             }
-            bail!("no workspace at supplied path; run jta init");
+        } else {
+            Self::for_project(&std::env::current_dir()?)?
+        };
+        if !ws.data_dir().join("config.json").exists() {
+            bail!("No analysis for this project yet. Start with jta analyze.");
         }
-        for root in start.ancestors() {
-            if root.join(".jta/config.json").exists() {
-                return Ok(Self {
-                    root: root.to_owned(),
-                });
-            }
-            if root.join(".git").exists() {
-                break;
-            }
-        }
-        bail!("no .jta workspace found within this project; run jta init")
+        Ok(ws)
     }
     pub fn data_dir(&self) -> PathBuf {
-        self.root.join(".jta")
+        self.data.clone()
+    }
+    pub fn save_config(&self, config: &Config) -> Result<()> {
+        atomic(&self.data_dir().join("config.json"), config)
+    }
+    pub fn save_report(&self, id: &str, report: &str) -> Result<PathBuf> {
+        safe(id)?;
+        let directory = self.data_dir().join("reports");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{id}.md"));
+        let mut tmp = tempfile::NamedTempFile::new_in(&directory)?;
+        tmp.write_all(report.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e| e.error)?;
+        Ok(path)
     }
     pub fn config(&self) -> Result<Config> {
         Ok(serde_json::from_slice(&fs::read(

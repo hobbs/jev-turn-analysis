@@ -19,7 +19,9 @@ optional `project_root` (serde default for old evidence). Source `agent` remains
 `codex` or `claude_code`; neither sessions nor tasks are merged across agents.
 
 - `jta analyze` with no path discovers both sources for cwd's project and initializes
-  a project-local workspace if needed. Explicit `--workspace` chooses storage only.
+  storage in `~/.jta/projects/<name>-<canonical-path-hash>/` if needed. `JTA_HOME`
+  overrides the base; explicit `--workspace DIR` uses `DIR/.jta`. Local `.jta`
+  folders are not searched. Project identity stays independent of storage.
 - `jta discover` lists matching files and source counts offline; no service calls.
 - Discovery supports `--project PATH`, `--agent codex|claude|all`,
   `--codex-home PATH`, and `--claude-config-dir PATH`. Explicit roots completely
@@ -106,7 +108,10 @@ ingest::import_path(path: &Path, config: &Config) -> Result<Vec<Session>>
 ingest::parse_file(path: &Path, config: &Config) -> Result<Session>
 store::Workspace::init(root: &Path, config: &Config) -> Result<Workspace>
 store::Workspace::discover(explicit: Option<&Path>) -> Result<Workspace>
-Workspace { pub root: PathBuf } // root containing .jta, not .jta itself
+store::Workspace::for_project(project: &Path) -> Result<Workspace>
+store::Workspace::open_or_init(explicit: Option<&Path>, project: &Path) -> Result<Workspace>
+Workspace { pub root: PathBuf, /* private data path */ } // root supplies .env and context
+Workspace::data_dir() -> PathBuf // actual per-project or explicit storage location
 Workspace::config() -> Result<Config>
 Workspace::save_session(&Session) -> Result<()>
 Workspace::sessions() -> Result<Vec<Session>> // current revision of each session

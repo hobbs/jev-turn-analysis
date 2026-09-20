@@ -92,3 +92,18 @@ pub fn analysis_fingerprint(config: &Config) -> String {
         .expect("serializable config"),
     )
 }
+
+/// Shared user-level base for per-project data and global credentials.
+pub fn data_home() -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context;
+    use std::path::PathBuf;
+    std::env::var_os("JTA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".jta"))
+        })
+        .context("configuration: set HOME or JTA_HOME to store jta data")
+}

@@ -3,7 +3,11 @@
 Jev scoring uses the [official TypeSafe evaluation API](https://docs.typesafe.ai/api):
 `POST https://api.typesafe.ai/v1/systemone`, bearer authentication, and a body with
 `model`, `state`, and a named `questions` map. The default model is `jev-latest`;
-the CLI reads `JEV_API_KEY` (the environment variable name is configurable).
+the CLI resolves `JEV_API_KEY` from the shell, project `.env`, or global
+`~/.jta/credentials.json`, in that order (the key name is configurable).
+Interactive `jta init` saves global credentials separately from project config;
+`JTA_HOME` overrides the global directory. Files are atomically written with
+user-only `0600` permissions on Unix. Keys never enter reports or config output.
 Every question is `choice`, with explicit instructions and a criteria map. Turn
 IDs appear in instructions because question-map keys do not enter inference.
 
@@ -44,11 +48,37 @@ and close probability margins are marked for further review.
 credentials or making network requests. Review uses Chat Completions with strict
 JSON Schema for [OpenAI](https://developers.openai.com/api/docs/guides/structured-outputs)
 and [OpenRouter](https://openrouter.ai/docs/guides/features/structured-outputs).
-OpenRouter requests require supporting provider parameters. Review proposals must
-include observed pattern, outcome effect, supporting session/turn pairs,
+OpenRouter requests require supporting provider parameters. Review responses
+include a plain-language `summary`, a `themes` array, and
+`recommendations`. Summary and themes are displayed only when all proposals pass
+the applicable support threshold, including when the model returns no proposals.
+Empty reviews preserve the model's explanation and observations in both JSON and
+Markdown. The prompt asks for the specific constraints that prevented an edit
+and what additional evidence or context would help. When local filtering rejects
+proposals, their accompanying prose is suppressed so rejected suggestions do not
+leak into the report; local rejection reasons remain visible.
+When no pattern meets the configured recurrence threshold, the default report
+runs a preliminary review requiring at least one supporting session per proposal.
+The prompt, report, and saved recommendations identify this limited support;
+`--recurring-only` retains the strict recurrence requirement.
+Review proposals must include observed pattern, outcome effect, supporting session/turn pairs,
 uncertainty, counterexamples, remediation surface, concrete change, scope, risk,
 and an evaluation plan. Local validation rejects malformed or unknown references.
 No generated review output is executed or used as a replacement for Jev scoring.
+
+`jta report` combines these proposals with full-corpus
+statistics in a Markdown file. Successful generation prints only the file path;
+JSON mode returns `report_path` and `data_path`, with the full data stored in the
+JSON companion. Explicit dry runs still expose the request for inspection.
+Report generation suppresses request progress and correction notices; failures
+remain errors. With no configured provider, statistics are saved with an
+explanation that recommendations are unavailable.
+
+The system prompt embeds the pinned MIT-licensed
+[Humanizer skill](../third_party/humanizer/SOURCE.md) in embedded mode. It edits
+prose within the structured response, preserving the schema, literal file edits,
+quoted context, counts, and citations. This adds prompt context but no separate
+rewriting request. Grounding validation still applies to the final response.
 
 HTTP uses configurable total request timeouts, a maximum twenty-second connection
 timeout, no redirects, and at most three attempts for connection failures,

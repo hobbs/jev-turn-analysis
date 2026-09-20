@@ -3,12 +3,7 @@ use reqwest::{Client, Url};
 use serde_json::Value;
 use std::time::Duration;
 pub fn credential(name: &str) -> Result<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Missing API credential in configured environment variable {name}")
-        })
+    crate::credentials::required(name)
 }
 pub fn client(timeout: u64) -> Result<Client> {
     ensure!(timeout > 0, "service timeout must be positive");
@@ -35,6 +30,16 @@ pub async fn post(client: &Client, endpoint: &str, key: &str, payload: &Value) -
         "Service endpoint requires HTTPS (except loopback test servers)"
     );
     for attempt in 0..3u64 {
+        let call = crate::ui::request_started();
+        let service = if payload.get("questions").is_some() {
+            "Jev"
+        } else {
+            "Review provider"
+        };
+        let activity = crate::ui::Activity::new(format!(
+            "{service} API call {call} · attempt {} of 3",
+            attempt + 1
+        ));
         let response = client
             .post(url.clone())
             .bearer_auth(key)
@@ -68,6 +73,8 @@ pub async fn post(client: &Client, endpoint: &str, key: &str, payload: &Value) -
                         .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(1 << attempt)
                         .min(30);
+                    drop(activity);
+                    crate::ui::retry(format!("HTTP {} · retrying in {retry}s…", status.as_u16()));
                     tokio::time::sleep(Duration::from_secs(retry)).await;
                     continue;
                 }
@@ -78,6 +85,11 @@ pub async fn post(client: &Client, endpoint: &str, key: &str, payload: &Value) -
             }
             Err(error) => {
                 if attempt < 2 && (error.is_timeout() || error.is_connect()) {
+                    drop(activity);
+                    crate::ui::retry(format!(
+                        "Connection interrupted · retrying in {}s…",
+                        1 << attempt
+                    ));
                     tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                     continue;
                 }

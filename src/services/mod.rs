@@ -163,9 +163,12 @@ pub async fn score_session(session: &Session, config: &Config) -> Result<Analysi
     let mut answers = BTreeMap::new();
     let mut usage = Vec::new();
     let mut warnings = session.warnings.clone();
-    for request in requests {
+    let total = requests.len();
+    for (index, request) in requests.into_iter().enumerate() {
+        crate::ui::scoring_batch(index, total, &session.id);
         let response = transport::post(&client, &config.jev.endpoint, &key, &request).await?;
         let validated = validate_answers(&request, &response)?;
+        crate::ui::scored_batch(index + 1);
         for (question, distribution) in &validated {
             if let Some((alternative, probability)) = distribution.higher_probability_alternative()
             {

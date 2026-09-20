@@ -439,9 +439,18 @@ async fn http_contract_retries_rate_limit_and_preserves_payload() {
         (429, json!({"secret":"must not leak"})),
         (200, expected.clone()),
     ]);
-    let received = transport::post(&transport::client(10).unwrap(), &url, "test-key", &request)
-        .await
-        .unwrap();
+    let received = crate::ui::track(async {
+        let response = transport::post(&transport::client(10).unwrap(), &url, "test-key", &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::ui::requests(),
+            2,
+            "counts retry HTTP attempts, not logical batches"
+        );
+        response
+    })
+    .await;
     assert_eq!(received, expected);
     assert_eq!(handle.join().unwrap(), vec![request.clone(), request]);
 }
@@ -470,4 +479,33 @@ fn malformed_turn_identity_is_rejected_before_remote_work() {
     session.turns[1].id = 2;
     session.turns[1].event_indices = vec![usize::MAX];
     assert!(prepare_analysis(&session, &Config::default()).is_err());
+}
+
+#[tokio::test]
+async fn session_progress_counts_validated_batches_not_retries_or_failed_responses() {
+    let mut config = Config::default();
+    config.jev.max_questions = 32;
+    config.jev.api_key_env = "JTA_TEST_SESSION_PROGRESS_KEY".into();
+    std::env::set_var(&config.jev.api_key_env, "test-key");
+    let session = fixture();
+    let requests = prepare_analysis(&session, &config).unwrap();
+    assert_eq!(requests.len(), 2);
+    let (endpoint, handle) = server(vec![
+        (429, json!({})),
+        (200, answer(&requests[0])),
+        (200, json!({"answers":{}})),
+    ]);
+    config.jev.endpoint = endpoint;
+    crate::ui::track(async {
+        let (result, position) = crate::ui::observe_session(score_session(&session, &config)).await;
+        assert!(result.is_err());
+        assert_eq!(position, 1, "only the first batch was validated");
+        assert_eq!(
+            crate::ui::requests(),
+            3,
+            "retry is an API call, not another completed batch"
+        );
+    })
+    .await;
+    assert_eq!(handle.join().unwrap().len(), 3);
 }

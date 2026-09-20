@@ -5,6 +5,7 @@ use crate::{
     model::{Analysis, Session},
     services,
     store::Workspace,
+    ui,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -22,9 +23,14 @@ pub enum Format {
     Markdown,
 }
 #[derive(Parser, Debug)]
-#[command(name = "jta", version, about = "Outcome-aware agent session analysis")]
+#[command(
+    name = "jta",
+    version,
+    about = "Find what helps your coding agent finish tasks — and what to improve"
+)]
 pub struct Cli {
-    #[arg(long, global = true)]
+    /// Use <DIR>/.jta for storage instead of the per-project user directory.
+    #[arg(long, global = true, value_name = "DIR")]
     pub workspace: Option<PathBuf>,
     #[arg(long, global = true, value_enum, default_value = "text")]
     pub format: Format,
@@ -48,7 +54,11 @@ pub struct DiscoveryArgs {
 }
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Set up API keys and project preferences; supplied flags update existing settings.
     Init {
+        /// Use defaults and flags without asking questions.
+        #[arg(long)]
+        no_input: bool,
         #[arg(long)]
         jev_endpoint: Option<String>,
         #[arg(long)]
@@ -63,18 +73,17 @@ pub enum Command {
         review_model: Option<String>,
         #[arg(long)]
         review_api_key_env: Option<String>,
-        #[arg(long, default_value_t = 90)]
-        retention_days: u32,
-        #[arg(long, default_value_t = 3)]
-        min_pattern_sessions: usize,
+        #[arg(long)]
+        retention_days: Option<u32>,
+        #[arg(long)]
+        min_pattern_sessions: Option<usize>,
         #[arg(long)]
         redact_pattern: Vec<String>,
         #[arg(long)]
         no_redaction: bool,
     },
-    Import {
-        path: PathBuf,
-    },
+    /// Import exported session logs locally; no API calls.
+    Import { path: PathBuf },
     /// Analyze project sessions discovered locally, an explicit path, or all imported sessions.
     Analyze {
         #[command(flatten)]
@@ -92,10 +101,7 @@ pub enum Command {
         #[command(flatten)]
         discovery: DiscoveryArgs,
     },
-    Report {
-        #[command(flatten)]
-        filters: Filters,
-    },
+    /// Inspect a session, turn, pattern, or saved recommendation.
     Show {
         id: String,
         #[arg(long)]
@@ -105,13 +111,19 @@ pub enum Command {
         #[arg(long)]
         run: Option<String>,
     },
-    Review {
-        #[arg(long,value_parser=["codex","claude","claude_code","all"])]
-        agent: Option<String>,
-        #[arg(long)]
-        repo: Option<String>,
-        #[arg(long, default_value_t = 5)]
-        top: usize,
+    /// Generate a Markdown report with statistics and proposed workflow improvements.
+    Report {
+        #[command(flatten)]
+        filters: Filters,
+        /// Review this many priority patterns (default: 5, to bound cost and context).
+        #[arg(long, conflicts_with_all = ["all", "session"], value_parser = clap::value_parser!(u32).range(1..))]
+        top: Option<u32>,
+        /// Include every eligible pattern; may send a much larger request.
+        #[arg(long, conflicts_with = "session")]
+        all: bool,
+        /// Skip preliminary review when no pattern meets the recurrence threshold.
+        #[arg(long, conflicts_with = "session")]
+        recurring_only: bool,
         #[arg(long)]
         session: Option<String>,
         /// Include an additional instruction, skill, or implementation file in review context.
@@ -120,21 +132,24 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read saved suggestions and their proposed edits.
     Recommendations,
+    /// Save a baseline for a later comparison.
     Snapshot {
         name: String,
         #[command(flatten)]
         filters: Filters,
     },
-    Compare {
-        before: String,
-        after: String,
-    },
+    /// Compare outcomes before and after a workflow change.
+    Compare { before: String, after: String },
+    /// Export or import human judgments for calibration.
     Labels {
         #[command(subcommand)]
         action: LabelCommand,
     },
+    /// Compare human labels with Jev judgments.
     Calibration,
+    /// Remove retained data without touching original logs.
     Purge {
         #[arg(long)]
         older_than: Option<String>,
@@ -191,7 +206,7 @@ fn emit(format: Format, kind: &str, data: Value) -> Result<()> {
             if matches!(format, Format::Markdown) {
                 println!("# {heading}\n");
             } else {
-                println!("{heading}");
+                println!("{}", ui::heading(&heading));
             }
             if !compact(kind, &data, format) {
                 render(&data, 0);
@@ -209,13 +224,15 @@ fn render(v: &Value, depth: usize) {
                     println!("{pad}{}:", k.replace('_', " "));
                     render(v, depth + 1);
                 } else {
-                    println!(
-                        "{pad}{}: {}",
-                        k.replace('_', " "),
-                        v.as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| v.to_string())
-                    );
+                    if k.ends_with("_ms") && v.is_number() {
+                        println!(
+                            "{pad}{}: {}",
+                            k.trim_end_matches("_ms").replace('_', " "),
+                            ui::duration(v.as_f64().unwrap_or(0.0))
+                        );
+                    } else {
+                        println!("{pad}{}: {}", k.replace('_', " "), ui::value(v));
+                    }
                 }
             }
         }
@@ -224,20 +241,27 @@ fn render(v: &Value, depth: usize) {
                 render(x, depth);
             }
         }
-        _ => println!(
-            "{pad}{}",
-            v.as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| v.to_string())
-        ),
+        _ => println!("{pad}{}", ui::value(v)),
     }
 }
 fn pairs(w: &Workspace, f: &Filters) -> Result<Vec<(Session, Analysis)>> {
+    Ok(pairs_and_unscored(w, f)?.0)
+}
+type Corpus = Vec<(Session, Analysis)>;
+fn pairs_and_unscored(w: &Workspace, f: &Filters) -> Result<(Corpus, usize)> {
     if let Some(since) = &f.since {
         analytics::cutoff(since).context("arguments: invalid --since")?;
     }
     let mut sessions = w.sessions()?;
     let mut analyses = w.analyses()?;
+    let analyzed: BTreeSet<_> = analyses
+        .iter()
+        .map(|a| (&a.session_id, &a.revision))
+        .collect();
+    let unscored = sessions
+        .iter()
+        .filter(|s| !analyzed.contains(&(&s.id, &s.revision)))
+        .count();
     if let Some(run) = &f.run {
         let r: Run = w.load_json("runs", run)?;
         analyses.retain(|a| r.analysis_ids.contains(&a.id));
@@ -246,7 +270,7 @@ fn pairs(w: &Workspace, f: &Filters) -> Result<Vec<(Session, Analysis)>> {
             .map(|a| w.session(&a.session_id, Some(&a.revision)))
             .collect::<Result<_>>()?;
     }
-    analytics::cohort(&sessions, &analyses, f)
+    Ok((analytics::cohort(&sessions, &analyses, f)?, unscored))
 }
 fn import(w: &Workspace, path: &Path, c: &Config) -> Result<(Vec<Session>, Vec<String>)> {
     let (s, errors) = ingest::import_batch(path, c)?;
@@ -262,12 +286,17 @@ fn import(w: &Workspace, path: &Path, c: &Config) -> Result<(Vec<Session>, Vec<S
     Ok((s, errors))
 }
 pub async fn execute(cli: Cli) -> Result<i32> {
+    let quiet = matches!(&cli.command, Command::Report { .. });
+    ui::quiet(quiet, ui::track(execute_inner(cli))).await
+}
+async fn execute_inner(cli: Cli) -> Result<i32> {
     let format = cli.format;
     if let Command::Init {
+        no_input,
         jev_endpoint,
         jev_api_key_env,
         jev_model,
-        review_provider,
+        mut review_provider,
         review_endpoint,
         review_model,
         review_api_key_env,
@@ -277,14 +306,29 @@ pub async fn execute(cli: Cli) -> Result<i32> {
         no_redaction,
     } = cli.command
     {
-        if min_pattern_sessions == 0 {
+        if min_pattern_sessions == Some(0) {
             bail!("configuration: min-pattern-sessions must be positive");
         }
-        let mut c = Config {
-            retention_days,
-            min_pattern_sessions,
-            ..Config::default()
-        };
+        let w = Workspace::open_or_init(cli.workspace.as_deref(), &std::env::current_dir()?)?;
+        let mut c = w.config()?;
+        let _ = dotenvy::from_path(w.root.join(".env"));
+        if !no_input
+            && matches!(format, Format::Text)
+            && ui::interactive()
+            && review_provider.is_none()
+        {
+            eprintln!(
+                "Set up this project. Press Enter to keep the current choice.\nData: {}",
+                w.data_dir().display()
+            );
+            review_provider = Some(ui::choose_provider(&c.review.provider)?);
+        }
+        if let Some(v) = retention_days {
+            c.retention_days = v;
+        }
+        if let Some(v) = min_pattern_sessions {
+            c.min_pattern_sessions = v;
+        }
         if let Some(v) = jev_endpoint {
             c.jev.endpoint = v;
         }
@@ -295,11 +339,14 @@ pub async fn execute(cli: Cli) -> Result<i32> {
             c.jev.model = v;
         }
         if let Some(v) = review_provider {
-            if v == "openrouter" {
+            if v == "openai" && c.review.provider != "openai" {
+                c.review = config::ReviewConfig::default();
+            }
+            if v == "openrouter" && c.review.provider != "openrouter" {
                 c.review.endpoint = "https://openrouter.ai/api/v1/chat/completions".into();
                 c.review.api_key_env = "OPENROUTER_API_KEY".into();
                 c.review.model = "openai/gpt-4.1".into();
-            } else if v != "openai" && v != "none" {
+            } else if v != "openai" && v != "none" && v != "openrouter" {
                 bail!("configuration: unsupported review provider");
             }
             c.review.provider = v;
@@ -313,18 +360,32 @@ pub async fn execute(cli: Cli) -> Result<i32> {
         if let Some(v) = review_api_key_env {
             c.review.api_key_env = v;
         }
-        c.redaction.enabled = !no_redaction;
-        c.redaction.patterns = redact_pattern;
+        if no_redaction {
+            c.redaction.enabled = false;
+        }
+        if !redact_pattern.is_empty() {
+            c.redaction.patterns = redact_pattern;
+        }
         crate::redact::Redactor::new(&c.redaction).context("configuration: redaction")?;
-        let root = match cli.workspace {
-            Some(path) => path,
-            None => discovery::resolve_project(&std::env::current_dir()?)?,
-        };
-        let w = Workspace::init(&root, &c)?;
+        w.save_config(&c)?;
+        if !no_input && matches!(format, Format::Text) && ui::interactive() {
+            eprintln!(
+                "Keys saved here work across projects: {}",
+                crate::credentials::path()?.display()
+            );
+            eprintln!("Shell and project .env values override saved keys.");
+            crate::credentials::prompt(&c.jev.api_key_env, "Jev")?;
+            if c.review.provider != "none" && c.review.api_key_env != c.jev.api_key_env {
+                crate::credentials::prompt(&c.review.api_key_env, &c.review.provider)?;
+            }
+        }
         emit(
             format,
             "workspace",
-            json!({"root":w.root,"configuration":w.config()?}),
+            json!({"root":w.root,"data_dir":w.data_dir(),"configuration":c,
+            "credentials_file":crate::credentials::path().ok(),
+            "jev_key_ready":crate::credentials::resolve(&c.jev.api_key_env)?.is_some(),
+            "review_key_ready":crate::credentials::resolve(&c.review.api_key_env)?.is_some()}),
         )?;
         return Ok(0);
     }
@@ -333,7 +394,7 @@ pub async fn execute(cli: Cli) -> Result<i32> {
         let result = discovery::discover(&options)?;
         let config = match &cli.workspace {
             Some(path) => Workspace::discover(Some(path))?.config()?,
-            None => Workspace::discover(Some(&result.project_root))
+            None => Workspace::for_project(&result.project_root)
                 .and_then(|w| w.config())
                 .unwrap_or_default(),
         };
@@ -356,25 +417,19 @@ pub async fn execute(cli: Cli) -> Result<i32> {
             bail!("arguments: --project, --codex-home and --claude-config-dir require no-path analyze");
         }
     }
-    let w = if let Command::Analyze {
-        path: None,
-        all: false,
-        discovery: args,
-        ..
+    let project = if let Command::Analyze {
+        discovery: args, ..
     } = &cli.command
     {
-        let target =
-            discovery::resolve_project(&args.project.clone().unwrap_or(std::env::current_dir()?))?;
-        let storage = cli.workspace.clone().unwrap_or(target);
-        let existed = storage.join(".jta/config.json").exists();
-        let workspace = Workspace::init(&storage, &Config::default())?;
-        if !existed {
-            eprintln!(
-                "Created analysis workspace at {}",
-                workspace.data_dir().display()
-            );
-        }
-        workspace
+        args.project.clone().unwrap_or(std::env::current_dir()?)
+    } else {
+        std::env::current_dir()?
+    };
+    let w = if matches!(
+        &cli.command,
+        Command::Analyze { .. } | Command::Import { .. }
+    ) {
+        Workspace::open_or_init(cli.workspace.as_deref(), &project)?
     } else {
         Workspace::discover(cli.workspace.as_deref())?
     };
@@ -398,6 +453,8 @@ pub async fn execute(cli: Cli) -> Result<i32> {
             refresh,
             dry_run,
         } => {
+            eprintln!("Finding and importing sessions…");
+            let started = std::time::Instant::now();
             let mut selection =
                 json!({"mode":if all{"imported"}else{"explicit_path"},"agent":args.agent});
             let (mut sessions, import_failures) = if let Some(p) = path {
@@ -472,6 +529,39 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                 return Ok(i32::from(!import_failures.is_empty()));
             }
             let existing = w.analyses()?;
+            let fingerprint = config::analysis_fingerprint(&c);
+            let cached_for = |s: &Session| {
+                existing
+                    .iter()
+                    .filter(|a| {
+                        !refresh
+                            && a.session_id == s.id
+                            && a.revision == s.revision
+                            && a.config_fingerprint == fingerprint
+                            && a.rubric_version == crate::model::RUBRIC_VERSION
+                    })
+                    .max_by_key(|a| &a.created_at)
+            };
+            let cached_count = sessions.iter().filter(|s| cached_for(s).is_some()).count();
+            eprintln!(
+                "Preparing request batches for {} sessions ({} cached)…",
+                sessions.len(),
+                cached_count
+            );
+            let planned = sessions
+                .iter()
+                .filter(|s| cached_for(s).is_none())
+                .filter_map(|s| services::prepare_analysis(s, &c).ok().map(|r| r.len()))
+                .sum::<usize>();
+            eprintln!(
+                "{} sessions · {} cached · {} Jev requests planned, before retries",
+                sessions.len(),
+                cached_count,
+                planned
+            );
+            selection["planned_requests"] = json!(planned);
+            selection["cached_sessions"] = json!(cached_count);
+            let total_sessions = sessions.len();
             let mut run = Run {
                 id: identifier("run"),
                 created_at: now(),
@@ -479,50 +569,43 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                 failures: import_failures,
                 selection,
             };
-            for s in sessions {
-                let cached = existing
-                    .iter()
-                    .filter(|a| {
-                        a.session_id == s.id
-                            && a.revision == s.revision
-                            && a.config_fingerprint == config::analysis_fingerprint(&c)
-                            && a.rubric_version == crate::model::RUBRIC_VERSION
-                    })
-                    .max_by_key(|a| &a.created_at);
+            let progress = ui::AnalysisProgress::new(total_sessions);
+            for (index, s) in sessions.into_iter().enumerate() {
+                let mut row = progress.session(index, &s);
+                let cached = cached_for(&s);
                 if let Some(a) = cached.filter(|_| !refresh) {
                     run.analysis_ids.push(a.id.clone());
-                    eprintln!("{}: reused cached analysis", s.id);
+                    row.finish("cached");
                 } else {
-                    match services::score_session(&s, &c).await {
+                    match row.run(services::score_session(&s, &c)).await {
                         Ok(a) => {
+                            row.saving();
                             w.save_analysis(&a)?;
                             run.analysis_ids.push(a.id);
-                            eprintln!("{}: scored", s.id);
+                            row.finish("scored");
                         }
                         Err(e) => {
-                            eprintln!("{}: {e}", s.id);
+                            row.finish("failed");
+                            progress.error(&format!("  {}: {e}", s.id));
                             run.failures.push(s.id.clone());
                         }
                     }
                 }
+                run.selection["api_calls"] = json!(ui::requests());
                 w.save_json("runs", &run.id, &run)?;
             }
+            run.selection["api_calls"] = json!(ui::requests());
+            run.selection["elapsed_seconds"] = json!(started.elapsed().as_secs());
             w.save_json("runs", &run.id, &run)?;
-            emit(format, "analysis_run", serde_json::to_value(&run)?)?;
+            progress.finish();
+            let mut output = serde_json::to_value(&run)?;
+            let filters = Filters {
+                run: Some(run.id.clone()),
+                ..Filters::default()
+            };
+            output["report"] = analytics::report(&pairs(&w, &filters)?, &filters)?;
+            emit(format, "analysis_run", output)?;
             return Ok(i32::from(!run.failures.is_empty()));
-        }
-        Command::Report { filters } => {
-            let p = pairs(&w, &filters)?;
-            let mut r = analytics::report(&p, &filters)?;
-            let all_analyses = w.analyses()?;
-            r["unscored_current_sessions"] = json!(w
-                .sessions()?
-                .iter()
-                .filter(|s| !all_analyses
-                    .iter()
-                    .any(|a| a.session_id == s.id && a.revision == s.revision))
-                .count());
-            emit(format, "report", r)?;
         }
         Command::Show {
             id,
@@ -583,33 +666,52 @@ pub async fn execute(cli: Cli) -> Result<i32> {
             };
             emit(format, "show", data)?;
         }
-        Command::Review {
-            agent,
-            repo,
+        Command::Report {
+            filters,
             top,
+            all,
+            recurring_only,
             session,
             context,
             dry_run,
         } => {
-            let mut p = pairs(
-                &w,
-                &Filters {
-                    agent,
-                    repo,
-                    ..Filters::default()
-                },
-            )?;
+            let (mut p, unscored) = pairs_and_unscored(&w, &filters)?;
             if let Some(id) = &session {
                 p.retain(|(s, _)| &s.id == id);
                 if p.is_empty() {
                     bail!("no analyzed session found");
                 }
             }
-            let patterns = analytics::patterns(&p)
-                .into_iter()
-                .filter(|x| session.is_some() || x.sessions >= c.min_pattern_sessions)
-                .take(top)
+            // Compute the full filtered corpus before sampling recommendation evidence.
+            let mut statistics = analytics::report(&p, &filters)?;
+            statistics["unscored_current_sessions"] = json!(unscored);
+            let sources = p
+                .iter()
+                .map(|(s, _)| json!({"session_id":s.id,"revision":s.revision}))
                 .collect::<Vec<_>>();
+            let candidates =
+                serde_json::from_value::<Vec<analytics::Pattern>>(statistics["patterns"].clone())?;
+            let recurrence_minimum = c.min_pattern_sessions.max(1);
+            let preliminary = session.is_none()
+                && !recurring_only
+                && !candidates.is_empty()
+                && candidates.iter().all(|x| x.sessions < recurrence_minimum);
+            let minimum_sessions = if session.is_some() || preliminary {
+                1
+            } else {
+                recurrence_minimum
+            };
+            let eligible = candidates
+                .into_iter()
+                .filter(|x| x.sessions >= minimum_sessions)
+                .collect::<Vec<_>>();
+            let eligible_count = eligible.len();
+            let limit = if all || session.is_some() {
+                usize::MAX
+            } else {
+                top.unwrap_or(5) as usize
+            };
+            let patterns = eligible.into_iter().take(limit).collect::<Vec<_>>();
             if session.is_none() {
                 let mut sampled = BTreeSet::new();
                 for pattern in &patterns {
@@ -659,7 +761,12 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                 }
                 p.retain(|(s, _)| sampled.contains(&s.id));
             }
+            let selection = json!({"eligible_patterns":eligible_count,"selected_patterns":patterns.len(),
+                "sampled_sessions":p.len(),"minimum_sessions":minimum_sessions,
+                "preliminary":preliminary,"recurrence_minimum_sessions":recurrence_minimum,
+                "isolated":session.is_some(),"limit":if all || session.is_some(){None}else{Some(limit)}});
             let mut evidence = review_evidence(&p, &patterns, session.is_some());
+            evidence["preliminary"] = json!(preliminary);
             evidence["project_context"] =
                 crate::review_context::collect(&w.root, &p, &context, &c)?;
             crate::redact::Redactor::new(&c.redaction)?.value(&mut evidence);
@@ -667,13 +774,23 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                 emit(
                     format,
                     "review_preview",
-                    json!({"destination":c.review.endpoint,"provider":c.review.provider,"request":services::prepare_review(&evidence,&c)?}),
+                    json!({"destination":c.review.endpoint,"provider":c.review.provider,"selection":selection,"request":services::prepare_review(&evidence,&c)?}),
                 )?;
             } else if p.is_empty() {
-                emit(
+                finish_review(
+                    &w,
                     format,
-                    "review",
-                    json!({"recommendations":[],"message":"No eligible recurring patterns"}),
+                    json!({"recommendations":[],"selection":selection,"api_calls":0,
+                    "message":if statistics["sessions"].as_u64() == Some(0) {
+                        "No analyzed sessions match this report. Run jta analyze or adjust the report filters. No API request sent."
+                    } else if recurring_only {
+                        "No patterns meet the recurrence threshold. Run jta report without --recurring-only for a preliminary review, or analyze more sessions. No API request sent."
+                    } else {
+                        "No opportunity patterns match this report. Adjust the report filters or use jta report --session <id> for one analyzed session. No API request sent."
+                    }}),
+                    &statistics,
+                    &sources,
+                    &filters,
                 )?;
             } else if !evidence["project_context"]["projects"]
                 .as_array()
@@ -683,12 +800,29 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                         .any(|p| p["files"].as_array().is_some_and(|files| !files.is_empty()))
                 })
             {
-                emit(
+                finish_review(
+                    &w,
                     format,
-                    "review",
-                    json!({"recommendations":[],"message":"No readable project files available to ground recommendations. Restore the selected project or supply --context <file>. No LLM request sent."}),
+                    json!({"recommendations":[],"selection":selection,"api_calls":0,
+                    "message":"No readable project files available to ground recommendations. Restore the selected project or supply --context <file>. No LLM request sent."}),
+                    &statistics,
+                    &sources,
+                    &filters,
+                )?;
+            } else if c.review.provider == "none" {
+                finish_review(
+                    &w,
+                    format,
+                    json!({"recommendations":[],"selection":selection,"api_calls":0,
+                    "message":"Recommendations are unavailable because no review provider is configured. Run jta init to choose OpenAI or OpenRouter, then generate the report again. No API request sent."}),
+                    &statistics,
+                    &sources,
+                    &filters,
                 )?;
             } else {
+                if preliminary && !matches!(format, Format::Json) {
+                    eprintln!("{}", ui::review_scope(&selection));
+                }
                 let result = services::review(&evidence, &c).await.with_context(|| {
                     format!(
                         "Review failed using configuration {}",
@@ -698,11 +832,6 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                 let mut saved = vec![];
                 let mut skipped = vec![];
                 let mut warnings = vec![];
-                let minimum_sessions = if session.is_some() {
-                    1
-                } else {
-                    c.min_pattern_sessions.max(1)
-                };
                 for (index, proposal) in result["recommendations"]
                     .as_array()
                     .context("review response missing recommendations")?
@@ -742,6 +871,8 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                     let id = identifier("r");
                     v["id"] = json!(id);
                     v["isolated"] = json!(session.is_some());
+                    v["preliminary"] = json!(preliminary);
+                    v["supporting_sessions"] = json!(support.len());
                     v["grounding_version"] = json!(1);
                     v["created_at"] = json!(now());
                     v["source_evidence"] = evidence.clone();
@@ -763,13 +894,20 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                         v,
                     )?;
                 }
-                let mut output = json!({"recommendations":saved,"skipped_recommendations":skipped,"warnings":warnings});
+                let mut output = json!({"recommendations":saved,"skipped_recommendations":skipped,"warnings":warnings,"selection":selection,"api_calls":ui::requests()});
                 if saved.is_empty() && !skipped.is_empty() {
-                    output["message"] = json!("No recommendations met the recurrence threshold. Use jta review --session <session-id> to review an isolated finding.");
+                    output["message"] = json!("No recommendations met the recurrence threshold. Use jta report --session <session-id> to review an isolated finding.");
                 } else if saved.is_empty() {
                     output["message"] = json!("No project-specific edits were supported by the selected sessions and current project files.");
                 }
-                emit(format, "review", output)?;
+                // An empty model result can still explain why no edit was justified.
+                // Suppress prose only when local filtering rejected proposals it may describe.
+                if skipped.is_empty() {
+                    output["summary"] = result["summary"].clone();
+                    output["themes"] = result["themes"].clone();
+                }
+                crate::redact::Redactor::new(&c.redaction)?.value(&mut output);
+                finish_review(&w, format, output, &statistics, &sources, &filters)?;
             }
         }
         Command::Recommendations => emit(
@@ -1034,11 +1172,18 @@ fn purge(w: &Workspace, format: Format, age: &str, dry_run: bool) -> Result<()> 
             break;
         }
     }
-    let objects = records
+    let mut objects = records
         .iter()
         .filter(|(_, v)| retained_expired(v, &expired, &artifact_ids))
         .map(|(p, _)| p.clone())
         .collect::<Vec<_>>();
+    let markdown = objects
+        .iter()
+        .filter(|p| p.parent() == Some(dir.join("reports").as_path()))
+        .map(|p| p.with_extension("md"))
+        .filter(|p| p.exists())
+        .collect::<Vec<_>>();
+    objects.extend(markdown);
     if !dry_run {
         for p in &objects {
             fs::remove_file(p)?;
@@ -1074,99 +1219,118 @@ fn retained_expired(
         _ => false,
     }
 }
-fn render_recommendation(r: &Value, format: Format) {
-    println!(
-        "\n{}{}  {}",
-        if matches!(format, Format::Markdown) {
-            "## "
-        } else {
-            ""
-        },
-        r["id"].as_str().unwrap_or("?"),
-        r["title"].as_str().unwrap_or("?")
-    );
-    if let Some(project) = r["project_root"].as_str() {
-        println!("\nProject: {project}");
-    }
-    if let Some(targets) = r["targets"].as_array() {
-        for target in targets {
-            println!(
-                "\n{}: {}",
-                if target["action"] == "create" {
-                    "Create"
-                } else {
-                    "Edit"
-                },
-                target["path"].as_str().unwrap_or("?")
-            );
-            if let Some(before) = target["before"].as_str().filter(|s| !s.is_empty()) {
-                println!("\nReplace this passage:\n");
-                for line in before.lines() {
-                    println!("    {line}");
-                }
-            }
-            println!(
-                "\n{}:\n",
-                if target["action"] == "create" {
-                    "New file content"
-                } else {
-                    "With"
-                }
-            );
-            if let Some(after) = target["after"].as_str() {
-                for line in after.lines() {
-                    println!("    {line}");
-                }
-            }
-            if let Some(rationale) = target["rationale"].as_str() {
-                println!("\nWhy here: {rationale}");
-            }
-            if let Some(refs) = target["context_refs"].as_array() {
-                for reference in refs {
-                    println!(
-                        "\nFile evidence ({}): {}",
-                        reference["path"].as_str().unwrap_or("?"),
-                        reference["quote"].as_str().unwrap_or("?")
-                    );
-                }
-            }
+fn finish_review(
+    w: &Workspace,
+    format: Format,
+    mut output: Value,
+    statistics: &Value,
+    sources: &[Value],
+    filters: &Filters,
+) -> Result<()> {
+    let id = identifier("report");
+    output["id"] = json!(id);
+    output["created_at"] = json!(now());
+    output["statistics"] = statistics.clone();
+    output["filters"] = serde_json::to_value(filters)?;
+    output["sources"] = json!(sources);
+    let report = crate::report::markdown(&output);
+    let path = w.save_report(&id, &report)?;
+    output["report_path"] = json!(path);
+    let data_path = w.data_dir().join("reports").join(format!("{id}.json"));
+    // The exact statistics and all source revisions stay available for scripts and retention.
+    w.save_json("reports", &id, &output)?;
+    if matches!(format, Format::Json) {
+        emit(
+            format,
+            "report_generated",
+            json!({"report_path":path,"data_path":data_path}),
+        )
+    } else {
+        if let Some(message) = output["message"].as_str() {
+            eprintln!("{message}");
         }
-    }
-    for (key, label) in [
-        ("remediation_surface", "Surface"),
-        ("proposed_change", "Proposed change"),
-        ("scope", "Applies to"),
-        ("observed_pattern", "Observed behavior"),
-        ("outcome_effect", "Effect"),
-        ("evaluation_plan", "How to evaluate"),
-        ("risk", "Risk"),
-        ("uncertainty", "Uncertainty"),
-    ] {
-        if let Some(text) = r[key].as_str().filter(|text| !text.trim().is_empty()) {
-            println!("\n{label}: {text}");
-        }
-    }
-    if let Some(examples) = r["counterexamples"].as_array().filter(|a| !a.is_empty()) {
-        println!("\nCounterexamples:");
-        for example in examples.iter().filter_map(Value::as_str) {
-            println!("  - {example}");
-        }
-    }
-    if let Some(refs) = r["supporting_refs"].as_array() {
-        println!("\nEvidence:");
-        for reference in refs {
-            if let (Some(session), Some(turn)) = (
-                reference["session_id"].as_str(),
-                reference["turn_id"].as_u64(),
-            ) {
-                println!("  - jta show {session} --turn {turn}");
-            }
-        }
+        println!("Generated Markdown report: {}", path.display());
+        Ok(())
     }
 }
 
 fn compact(kind: &str, data: &Value, format: Format) -> bool {
     match kind {
+        "workspace" => {
+            println!(
+                "Ready for {}",
+                data["root"].as_str().unwrap_or("this project")
+            );
+            println!(
+                "Data and config: {}",
+                data["data_dir"].as_str().unwrap_or("?")
+            );
+            if let Some(path) = data["credentials_file"].as_str() {
+                println!("Global credentials: {path}");
+            }
+            println!(
+                "Jev: {} · {} {}",
+                data["configuration"]["jev"]["model"]
+                    .as_str()
+                    .unwrap_or("?"),
+                data["configuration"]["jev"]["api_key_env"]
+                    .as_str()
+                    .unwrap_or("JEV_API_KEY"),
+                if data["jev_key_ready"] == true {
+                    "is set"
+                } else {
+                    "is missing"
+                }
+            );
+            println!(
+                "Review provider: {}",
+                data["configuration"]["review"]["provider"]
+                    .as_str()
+                    .unwrap_or("none")
+            );
+            if data["configuration"]["review"]["provider"] != "none"
+                && data["review_key_ready"] != true
+            {
+                println!(
+                    "Run jta init to save {}, or set it in your shell/project .env.",
+                    data["configuration"]["review"]["api_key_env"]
+                        .as_str()
+                        .unwrap_or("?")
+                );
+            }
+            println!("\nNext: jta analyze     (or jta analyze --dry-run to preview)");
+            true
+        }
+        "analysis_preview" => {
+            let sessions = data["payloads"].as_array().cloned().unwrap_or_default();
+            let requests = sessions
+                .iter()
+                .map(|s| s["requests"].as_array().map_or(0, Vec::len))
+                .sum::<usize>();
+            println!(
+                "{} sessions · {} Jev request batches for a fresh analysis",
+                sessions.len(),
+                requests
+            );
+            println!(
+                "Destination: {}",
+                data["destination"].as_str().unwrap_or("?")
+            );
+            println!("No requests sent. Cached results can reduce calls on a real run.");
+            println!("Use --format json to inspect the full redacted payload.");
+            render(&data["failures"], 0);
+            true
+        }
+        "review_preview" => {
+            println!("{}", ui::review_scope(&data["selection"]));
+            println!(
+                "Destination: {} · {}",
+                data["provider"].as_str().unwrap_or("none"),
+                data["destination"].as_str().unwrap_or("?")
+            );
+            println!("No requests sent. Use --format json to inspect the full redacted payload.");
+            true
+        }
         "discovery" => {
             println!(
                 "Project: {}",
@@ -1200,8 +1364,8 @@ fn compact(kind: &str, data: &Value, format: Format) -> bool {
             true
         }
         "analysis_run" => {
-            if data["selection"]["mode"] == "project_discovery" {
-                compact("discovery", &data["selection"], format);
+            if let Some(project) = data["selection"]["project_root"].as_str() {
+                println!("Project: {project}");
             }
             println!("Run: {}", data["id"].as_str().unwrap_or("unknown"));
             println!(
@@ -1209,6 +1373,22 @@ fn compact(kind: &str, data: &Value, format: Format) -> bool {
                 data["analysis_ids"].as_array().map_or(0, Vec::len),
                 data["failures"].as_array().map_or(0, Vec::len)
             );
+            println!(
+                "{} Jev API calls · {} cached sessions · {}s",
+                ui::value(&data["selection"]["api_calls"]),
+                ui::value(&data["selection"]["cached_sessions"]),
+                data["selection"]["elapsed_seconds"]
+            );
+            if let Some(counts) = data["report"]["counts"].as_object() {
+                println!("\nTask outcomes");
+                ui::counts(&counts["task_outcome"], matches!(format, Format::Text));
+                println!("\nVerification");
+                ui::counts(
+                    &counts["outcome_verification"],
+                    matches!(format, Format::Text),
+                );
+            }
+            println!("\nNext: jta report to generate statistics and suggested changes.");
             render(&data["failures"], 0);
             true
         }
@@ -1277,135 +1457,18 @@ fn compact(kind: &str, data: &Value, format: Format) -> bool {
             }
             true
         }
-        "report" => {
-            println!(
-                "{} sessions · {} selected turns",
-                data["sessions"], data["turns"]
-            );
-            for (key, label) in [
-                ("agent_breakdown", "Agents"),
-                ("project_breakdown", "Projects"),
-            ] {
-                if let Some(groups) = data[key].as_object() {
-                    println!("{label}:");
-                    for (name, stats) in groups {
-                        let count =
-                            |field: &str, label: &str| stats[field][label].as_u64().unwrap_or(0);
-                        let tokens = |key: &str| {
-                            let metric = &stats["resources"][key];
-                            format!(
-                                "{} (coverage {}/{} turns)",
-                                metric["total"]
-                                    .as_u64()
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "unknown".into()),
-                                metric["turn_coverage"].as_u64().unwrap_or(0),
-                                stats["turns"]
-                            )
-                        };
-                        println!(
-                            "  {name}: {} sessions, {} turns · complete {}, verified {}",
-                            stats["sessions"],
-                            stats["turns"],
-                            count("outcomes", "complete"),
-                            count("verification", "verified")
-                        );
-                        println!(
-                            "    Observed input tokens: {}; output tokens: {}",
-                            tokens("input_tokens"),
-                            tokens("output_tokens")
-                        );
-                    }
-                }
-            }
-            if let Some(counts) = data["counts"].as_object() {
-                for key in [
-                    "task_outcome",
-                    "outcome_verification",
-                    "user_intervention",
-                    "usefulness",
-                    "functional_role",
-                    "downstream_use",
-                    "opportunity",
-                    "remediation_surface",
-                ] {
-                    if let Some(v) = counts.get(key) {
-                        println!(
-                            "\n{}{}",
-                            if matches!(format, Format::Markdown) {
-                                "## "
-                            } else {
-                                ""
-                            },
-                            key.replace('_', " ")
-                        );
-                        if matches!(format, Format::Markdown) {
-                            println!("\n| Category | Count |\n| --- | ---: |");
-                        }
-                        if let Some(m) = v.as_object() {
-                            for (k, n) in m {
-                                if matches!(format, Format::Markdown) {
-                                    println!("| {k} | {n} |");
-                                } else {
-                                    println!("  {k:<40} {n}");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            println!(
-                "\nExcluded judgments: {} · uncertain turns: {}",
-                data["excluded_judgments"], data["uncertain_turns"]
-            );
-            println!("\nResources (observed; missing data remains unknown)");
-            render(&data["resources"], 1);
-            if data["groups"].as_object().is_some_and(|g| !g.is_empty()) {
-                println!("\nGroups");
-                render(&data["groups"], 1);
-            }
-            println!("\nPatterns to investigate");
-            if let Some(p) = data["patterns"].as_array() {
-                for p in p {
-                    println!(
-                        "  {}  {}  {} sessions",
-                        p["id"].as_str().unwrap_or("?"),
-                        p["opportunity"].as_str().unwrap_or("?"),
-                        p["sessions"]
-                    );
-                }
-            }
-            render(&data["warnings"], 0);
-            true
-        }
-        "recommendations" | "review" => {
-            let recommendations = if kind == "review" {
-                &data["recommendations"]
+        "recommendations" => {
+            let output = json!({"recommendations":data});
+            let report = ui::review_report(&output);
+            let body = report.trim_start_matches("# Review report\n\n");
+            if matches!(format, Format::Markdown) {
+                print!("{body}");
             } else {
-                data
-            };
-            if let Some(rs) = recommendations.as_array() {
-                if rs.is_empty() {
-                    println!("No reviewed proposals yet.");
-                }
-                for r in rs {
-                    if !r["targets"]
-                        .as_array()
-                        .is_some_and(|targets| !targets.is_empty())
-                    {
-                        println!("\n{}: older review omitted because it has no project file targets. Run jta review to generate project-grounded replacements; jta show {} retains the original record.", r["id"].as_str().unwrap_or("?"), r["id"].as_str().unwrap_or("?"));
-                        continue;
-                    }
-                    render_recommendation(r, format);
-                }
-            }
-            if kind == "review" {
-                if let Some(message) = data["message"].as_str() {
-                    println!("{message}");
-                }
-                if let Some(warnings) = data["warnings"].as_array() {
-                    for warning in warnings.iter().filter_map(Value::as_str) {
-                        println!("Warning: {warning}");
+                for line in body.lines() {
+                    if line.starts_with("##") {
+                        println!("{}", ui::heading(line.trim_start_matches('#').trim()));
+                    } else {
+                        println!("{line}");
                     }
                 }
             }

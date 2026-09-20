@@ -114,6 +114,9 @@ pub enum Command {
         top: usize,
         #[arg(long)]
         session: Option<String>,
+        /// Include an additional instruction, skill, or implementation file in review context.
+        #[arg(long = "context", value_name = "FILE")]
+        context: Vec<PathBuf>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -585,6 +588,7 @@ pub async fn execute(cli: Cli) -> Result<i32> {
             repo,
             top,
             session,
+            context,
             dry_run,
         } => {
             let mut p = pairs(
@@ -655,7 +659,10 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                 }
                 p.retain(|(s, _)| sampled.contains(&s.id));
             }
-            let evidence = review_evidence(&p, &patterns, session.is_some());
+            let mut evidence = review_evidence(&p, &patterns, session.is_some());
+            evidence["project_context"] =
+                crate::review_context::collect(&w.root, &p, &context, &c)?;
+            crate::redact::Redactor::new(&c.redaction)?.value(&mut evidence);
             if dry_run {
                 emit(
                     format,
@@ -667,6 +674,19 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                     format,
                     "review",
                     json!({"recommendations":[],"message":"No eligible recurring patterns"}),
+                )?;
+            } else if !evidence["project_context"]["projects"]
+                .as_array()
+                .is_some_and(|projects| {
+                    projects
+                        .iter()
+                        .any(|p| p["files"].as_array().is_some_and(|files| !files.is_empty()))
+                })
+            {
+                emit(
+                    format,
+                    "review",
+                    json!({"recommendations":[],"message":"No readable project files available to ground recommendations. Restore the selected project or supply --context <file>. No LLM request sent."}),
                 )?;
             } else {
                 let result = services::review(&evidence, &c).await?;
@@ -717,6 +737,7 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                     let id = identifier("r");
                     v["id"] = json!(id);
                     v["isolated"] = json!(session.is_some());
+                    v["grounding_version"] = json!(1);
                     v["created_at"] = json!(now());
                     v["source_evidence"] = evidence.clone();
                     v["agents"] = json!(p
@@ -740,6 +761,8 @@ pub async fn execute(cli: Cli) -> Result<i32> {
                 let mut output = json!({"recommendations":saved,"skipped_recommendations":skipped,"warnings":warnings});
                 if saved.is_empty() && !skipped.is_empty() {
                     output["message"] = json!("No recommendations met the recurrence threshold. Use jta review --session <session-id> to review an isolated finding.");
+                } else if saved.is_empty() {
+                    output["message"] = json!("No project-specific edits were supported by the selected sessions and current project files.");
                 }
                 emit(format, "review", output)?;
             }
@@ -1046,6 +1069,97 @@ fn retained_expired(
         _ => false,
     }
 }
+fn render_recommendation(r: &Value, format: Format) {
+    println!(
+        "\n{}{}  {}",
+        if matches!(format, Format::Markdown) {
+            "## "
+        } else {
+            ""
+        },
+        r["id"].as_str().unwrap_or("?"),
+        r["title"].as_str().unwrap_or("?")
+    );
+    if let Some(project) = r["project_root"].as_str() {
+        println!("\nProject: {project}");
+    }
+    if let Some(targets) = r["targets"].as_array() {
+        for target in targets {
+            println!(
+                "\n{}: {}",
+                if target["action"] == "create" {
+                    "Create"
+                } else {
+                    "Edit"
+                },
+                target["path"].as_str().unwrap_or("?")
+            );
+            if let Some(before) = target["before"].as_str().filter(|s| !s.is_empty()) {
+                println!("\nReplace this passage:\n");
+                for line in before.lines() {
+                    println!("    {line}");
+                }
+            }
+            println!(
+                "\n{}:\n",
+                if target["action"] == "create" {
+                    "New file content"
+                } else {
+                    "With"
+                }
+            );
+            if let Some(after) = target["after"].as_str() {
+                for line in after.lines() {
+                    println!("    {line}");
+                }
+            }
+            if let Some(rationale) = target["rationale"].as_str() {
+                println!("\nWhy here: {rationale}");
+            }
+            if let Some(refs) = target["context_refs"].as_array() {
+                for reference in refs {
+                    println!(
+                        "\nFile evidence ({}): {}",
+                        reference["path"].as_str().unwrap_or("?"),
+                        reference["quote"].as_str().unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+    for (key, label) in [
+        ("remediation_surface", "Surface"),
+        ("proposed_change", "Proposed change"),
+        ("scope", "Applies to"),
+        ("observed_pattern", "Observed behavior"),
+        ("outcome_effect", "Effect"),
+        ("evaluation_plan", "How to evaluate"),
+        ("risk", "Risk"),
+        ("uncertainty", "Uncertainty"),
+    ] {
+        if let Some(text) = r[key].as_str().filter(|text| !text.trim().is_empty()) {
+            println!("\n{label}: {text}");
+        }
+    }
+    if let Some(examples) = r["counterexamples"].as_array().filter(|a| !a.is_empty()) {
+        println!("\nCounterexamples:");
+        for example in examples.iter().filter_map(Value::as_str) {
+            println!("  - {example}");
+        }
+    }
+    if let Some(refs) = r["supporting_refs"].as_array() {
+        println!("\nEvidence:");
+        for reference in refs {
+            if let (Some(session), Some(turn)) = (
+                reference["session_id"].as_str(),
+                reference["turn_id"].as_u64(),
+            ) {
+                println!("  - jta show {session} --turn {turn}");
+            }
+        }
+    }
+}
+
 fn compact(kind: &str, data: &Value, format: Format) -> bool {
     match kind {
         "discovery" => {
@@ -1259,18 +1373,35 @@ fn compact(kind: &str, data: &Value, format: Format) -> bool {
             render(&data["warnings"], 0);
             true
         }
-        "recommendations" => {
-            if let Some(rs) = data.as_array() {
+        "recommendations" | "review" => {
+            let recommendations = if kind == "review" {
+                &data["recommendations"]
+            } else {
+                data
+            };
+            if let Some(rs) = recommendations.as_array() {
                 if rs.is_empty() {
                     println!("No reviewed proposals yet.");
                 }
                 for r in rs {
-                    println!(
-                        "{}  {}\n  Surface: {}",
-                        r["id"].as_str().unwrap_or("?"),
-                        r["title"].as_str().unwrap_or("?"),
-                        r["remediation_surface"].as_str().unwrap_or("?")
-                    );
+                    if !r["targets"]
+                        .as_array()
+                        .is_some_and(|targets| !targets.is_empty())
+                    {
+                        println!("\n{}: older review omitted because it has no project file targets. Run jta review to generate project-grounded replacements; jta show {} retains the original record.", r["id"].as_str().unwrap_or("?"), r["id"].as_str().unwrap_or("?"));
+                        continue;
+                    }
+                    render_recommendation(r, format);
+                }
+            }
+            if kind == "review" {
+                if let Some(message) = data["message"].as_str() {
+                    println!("{message}");
+                }
+                if let Some(warnings) = data["warnings"].as_array() {
+                    for warning in warnings.iter().filter_map(Value::as_str) {
+                        println!("Warning: {warning}");
+                    }
                 }
             }
             true

@@ -347,28 +347,93 @@ Priority: failed or partial tasks, then correctness and verification
 gaps, then avoidable effort in successful tasks.
 
 LLM destination: configured review provider
-Payload: redacted excerpts, linked context, and aggregate evidence
+Payload: redacted excerpts, linked context, aggregate evidence, and project files
 No request sent.
 ```
 
 Initial pattern candidates come from Jev categories and deterministic grouping. LLM review can connect related candidates, inspect causes, and propose a narrowly scoped change. It receives the relevant source context as well as aggregate evidence.
 
+Review produces only project-grounded proposals for the coding agent's instructions,
+skills, tools, and orchestration. It reads current `AGENTS.md`, `AGENT.md`,
+`CLAUDE.md`, instruction overrides, Markdown rules, and `SKILL.md` files within the
+selected projects, plus ancestor instructions. It includes installed `SKILL.md`
+files referenced by absolute path in selected sessions, limited to the configured
+Codex/Claude skills and plugins directories and `~/.agents/skills`. Aliased skill
+catalog entries alone are not resolved. Project READMEs, package manifests, and
+Makefiles provide concrete commands and workflow context.
+
+Use repeatable `--context <file>` options for additional skills, tool definitions,
+or implementation files (paths are relative to the invocation directory). Explicit
+files are included for each selected project; use `--repo` to limit a multi-project
+workspace. Review does not load arbitrary source code by default.
+
+```sh
+jta review --context docs/harness.md --context src/server/orchestrator.ts --dry-run --format json
+```
+
+Every proposal must name an exact project and file, provide a literal before/after
+edit, and cite both session turns and exact passages from inspected project files.
+Paths, existing passages, and quotations are validated before saving. Missing root
+`AGENTS.md` or `CLAUDE.md` files are explicit creation candidates; proposed new
+contents still require project-file evidence. A category-only suggestion such as
+"add a verification gate" is not accepted. If the evidence cannot support a
+project-specific edit, review returns no recommendations.
+If a response fails grounding validation, review makes at most one correction
+request with the validation error and checks the corrected response again. An
+invalid result is never saved; correction can incur a second provider request.
+
+Snapshots contain at most 64 files, 16,000 characters per file, and 96,000 characters
+in total across selected projects. Discovery stops at depth 12, skips dependencies,
+build outputs and `.jta`, and does not follow project symlinks. Unreadable files,
+files above 256 KiB, and truncation are disclosed in the preview. Files are freshly
+redacted before sending. These are current files, not reconstructed historical
+versions; the prompt instructs review to account for fixes already present.
+
 ```console
 $ jta recommendations
-r_01  Require relevant verification before claiming completion
-      Surface: AGENTS.md
-      Evidence: 4 sessions, 11 turns
-      Priority: verification gap
+r_01  Add the deck renderer to the export skill's completion check
 
-r_02  Stop identical retries when the failure is non-transient
-      Surface: tool_description
-      Evidence: 3 sessions, 16 turns
-      Priority: repeated failed approach
+Project: /work/deck-studio
 
-r_03  Reinforce early targeted tests for unfamiliar behavior
-      Surface: skill
-      Evidence: 5 sessions, 14 turns
-      Priority: effective behavior to reinforce
+Edit: /work/deck-studio/.claude/skills/export/SKILL.md
+
+Replace this passage:
+
+    Run npm test before handing off the deck.
+
+With:
+
+    Run npm test before handing off the deck. For export changes, run
+    npx tsx scripts/render-deck.ts .generated/<presentation-id>.pptx
+    and inspect the slide PNGs in .artifacts/qa/ for required visible labels.
+    Report the deck ID and any missing labels; do not report those as verified.
+
+Why here: This skill owns deck handoff, but currently requires only unit tests.
+
+File evidence (/work/deck-studio/README.md): npx tsx scripts/render-deck.ts .generated/<presentation-id>.pptx
+
+Surface: skill
+
+Proposed change: Extend the export skill's existing npm test instruction with the
+project's render-deck command and a visible-label check.
+
+Applies to: Changes affecting exported artifacts.
+
+Observed behavior: Completion claims cited builds without an artifact check.
+
+Effect: Users had to discover unusable exports after handoff.
+
+How to evaluate: Replay representative export tasks. Every export-success claim
+must link an artifact that opens; track task completion and verification time.
+
+Risk: Extra export latency.
+
+Uncertainty: Excerpts may omit checks performed elsewhere.
+
+Evidence:
+  - jta show s_014 --turn 18
+  - jta show s_015 --turn 7
+  - jta show s_016 --turn 12
 
 $ jta show r_01
 ```
@@ -378,8 +443,15 @@ Each recommendation includes:
 - The observed pattern and its effect on task outcomes.
 - Supporting session and turn references, uncertainty, and counterexamples.
 - The proposed remediation surface and concrete suggested wording or behavior.
+- Exact target paths, literal edits or new-file contents, and project-file citations.
 - The scope where it should apply and the risk of applying it too broadly.
 - A way to evaluate whether the change improves future sessions.
+
+`jta review` and `jta recommendations` display these details in text and Markdown.
+Older saved reviews without concrete file targets are flagged and omitted from
+the guidance; rerun `jta review` to generate grounded replacements. The old records
+remain available through `jta show <recommendation-id>` and `--format json`, which
+includes the full stored objects and source evidence. No proposed edits are applied.
 
 By default, harness recommendations require support from at least three distinct sessions. A serious isolated failure still appears in diagnostics and can be reviewed directly with `jta review --session s_014`; it is marked as an isolated finding. The recurrence threshold is configurable.
 

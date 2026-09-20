@@ -28,6 +28,82 @@ fn data(o: Output) -> Value {
     );
     serde_json::from_slice::<Value>(&o.stdout).unwrap()["data"].clone()
 }
+#[test]
+fn saved_recommendations_expose_action_and_evaluation_in_readable_formats() {
+    let temp = tempfile::tempdir().unwrap();
+    let w = Workspace::init(temp.path(), &Config::default()).unwrap();
+    // Grounded proposals must expose literal edits as well as their rationale.
+    let proposal = json!({
+        "id":"r_existing", "title":"Verify exported artifacts",
+        "project_root":"/project",
+        "targets":[{"path":"/project/AGENTS.md","action":"edit","before":"Run npm test.",
+            "after":"Run npm test and inspect the exported PPTX.","rationale":"The project delivers PPTX files.",
+            "context_refs":[{"path":"/project/README.md","quote":"Export a PPTX"}]}],
+        "remediation_surface":"AGENTS.md",
+        "proposed_change":"Before claiming export success, open the generated artifact.",
+        "scope":"Export changes", "observed_pattern":"Only a build was checked",
+        "outcome_effect":"Artifact usability unknown",
+        "evaluation_plan":"Replay the export task; pass when the artifact opens.",
+        "risk":"Additional latency", "uncertainty":"Limited evidence",
+        "counterexamples":["Documentation-only edits need no export."],
+        "supporting_refs":[{"session_id":"s_example","turn_id":7}],
+        "source_evidence":{"transcript":"RAW_EVIDENCE_SENTINEL"}
+    });
+    w.save_json("recommendations", "r_existing", &proposal)
+        .unwrap();
+    for format in ["text", "markdown"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_jta"))
+            .arg("--workspace")
+            .arg(temp.path())
+            .args(["recommendations", "--format", format])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        for key in [
+            "title",
+            "remediation_surface",
+            "proposed_change",
+            "scope",
+            "observed_pattern",
+            "outcome_effect",
+            "evaluation_plan",
+            "risk",
+            "uncertainty",
+        ] {
+            assert!(
+                text.contains(proposal[key].as_str().unwrap()),
+                "missing {key}: {text}"
+            );
+        }
+        assert!(text.contains("Documentation-only edits need no export."));
+        assert!(text.contains("jta show s_example --turn 7"));
+        assert!(!text.contains("RAW_EVIDENCE_SENTINEL"));
+        assert!(text.contains("Edit: /project/AGENTS.md"));
+        assert!(text.contains("Run npm test and inspect the exported PPTX."));
+    }
+    let saved = data(invoke(temp.path(), &["recommendations"]));
+    assert_eq!(saved, json!([proposal]));
+}
+#[test]
+fn legacy_generic_recommendations_are_retained_but_not_presented_as_guidance() {
+    let temp = tempfile::tempdir().unwrap();
+    let w = Workspace::init(temp.path(), &Config::default()).unwrap();
+    let legacy =
+        json!({"id":"r_legacy","title":"Generic advice","proposed_change":"Verify everything"});
+    w.save_json("recommendations", "r_legacy", &legacy).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_jta"))
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("recommendations")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("no project file targets"));
+    assert!(!text.contains("Verify everything"));
+    assert_eq!(data(invoke(temp.path(), &["show", "r_legacy"])), legacy);
+}
 fn dist(answers: &[&str], selected: &str) -> Distribution {
     Distribution {
         selected: selected.into(),
@@ -233,6 +309,64 @@ fn isolated_review_is_offline_and_recurring_default_excludes_single_session() {
     assert_eq!(evidence["sessions"].as_array().unwrap().len(), 1);
 }
 #[test]
+fn review_preview_includes_fresh_project_files_and_explicit_context() {
+    let temp = tempfile::tempdir().unwrap();
+    seed(temp.path());
+    std::fs::write(temp.path().join("CLAUDE.md"), "Use the export skill.").unwrap();
+    let extra = temp.path().join("tool.ts");
+    std::fs::write(
+        &extra,
+        "export function deck() {}\n// password=private-value",
+    )
+    .unwrap();
+    for instruction in [
+        "Use the export skill.",
+        "Read .claude/skills/export/SKILL.md before export.",
+    ] {
+        std::fs::write(temp.path().join("CLAUDE.md"), instruction).unwrap();
+        let preview = data(invoke(
+            temp.path(),
+            &[
+                "review",
+                "--session",
+                "s_test",
+                "--context",
+                extra.to_str().unwrap(),
+                "--dry-run",
+            ],
+        ));
+        let evidence: Value = serde_json::from_str(
+            preview["request"]["messages"][1]["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let context = &evidence["project_context"];
+        assert!(context.to_string().contains(instruction));
+        assert!(context.to_string().contains("export function deck()"));
+        assert!(!context.to_string().contains("private-value"));
+        assert_eq!(
+            context["projects"][0]["project_root"],
+            temp.path().canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+}
+#[test]
+fn review_without_project_files_returns_no_generic_advice_or_service_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let w = seed(temp.path());
+    let mut session = w.session("s_test", None).unwrap();
+    session.project_root = Some(temp.path().join("missing").to_string_lossy().into_owned());
+    w.save_session(&session).unwrap();
+    // No review provider or credential is configured: a service call would fail.
+    let result = data(invoke(temp.path(), &["review", "--session", "s_test"]));
+    assert!(result["recommendations"].as_array().unwrap().is_empty());
+    assert!(result["message"]
+        .as_str()
+        .unwrap()
+        .contains("No LLM request sent"));
+}
+#[test]
 fn purge_preserves_new_revision_and_its_analysis() {
     let temp = tempfile::tempdir().unwrap();
     let w = seed(temp.path());
@@ -334,9 +468,23 @@ fn review_skips_insufficient_support_without_discarding_eligible_proposals() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    for case in ["mixed", "all_skipped", "isolated", "unknown_reference"] {
+    for case in [
+        "mixed",
+        "all_skipped",
+        "isolated",
+        "unknown_reference",
+        "generic",
+        "invented_target",
+    ] {
         let temp = tempfile::tempdir().unwrap();
         let w = seed(temp.path());
+        std::fs::write(
+            temp.path().join("AGENTS.md"),
+            "Run npm test before delivery.",
+        )
+        .unwrap();
+        let project_root = temp.path().canonicalize().unwrap();
+        let target_path = project_root.join("AGENTS.md");
         let base = w.session("s_test", None).unwrap();
         let base_analysis: Analysis = w.load_json("analyses", "a_test").unwrap();
         for id in ["s_second", "s_third"] {
@@ -351,6 +499,10 @@ fn review_skips_insufficient_support_without_discarding_eligible_proposals() {
         let proposal = |ids: &[&str]| {
             json!({
                 "title":"Verify changes", "observed_pattern":"Checks omitted",
+                "project_root":project_root,
+                "targets":[{"path":target_path,"action":"edit","before":"Run npm test before delivery.",
+                    "after":"Run npm test before delivery and report the outcome.","rationale":"Expose the existing project check result.",
+                    "context_refs":[{"path":target_path,"quote":"Run npm test"}]}],
                 "outcome_effect":"Completion unverified", "uncertainty":"Limited evidence",
                 "counterexamples":[], "remediation_surface":"AGENTS.md",
                 "proposed_change":"Run relevant checks", "scope":"Coding tasks",
@@ -364,6 +516,16 @@ fn review_skips_insufficient_support_without_discarding_eligible_proposals() {
         let proposals = match case {
             "mixed" => vec![insufficient, eligible],
             "all_skipped" | "isolated" => vec![insufficient],
+            "generic" => {
+                let mut generic = eligible;
+                generic.as_object_mut().unwrap().remove("targets");
+                vec![generic]
+            }
+            "invented_target" => {
+                let mut invented = eligible;
+                invented["targets"][0]["path"] = json!("/invented/SKILL.md");
+                vec![invented]
+            }
             _ => vec![eligible, proposal(&["s_test", "s_second", "s_unknown"])],
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -432,7 +594,7 @@ fn review_skips_insufficient_support_without_discarding_eligible_proposals() {
         }
         let output = command.output().unwrap();
         handle.join().unwrap();
-        if case == "unknown_reference" {
+        if matches!(case, "unknown_reference" | "generic" | "invented_target") {
             assert!(!output.status.success());
             assert!(w.list_json::<Value>("recommendations").unwrap().is_empty());
             continue;

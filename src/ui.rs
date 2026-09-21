@@ -35,9 +35,9 @@ pub fn request_started() -> u64 {
 pub fn interactive() -> bool {
     io::stdin().is_terminal() && io::stderr().is_terminal()
 }
-pub fn choose_provider(current: &str) -> Result<String> {
+pub fn choose_backend(current: &str) -> Result<String> {
     loop {
-        eprint!("Optional LLM review: none / openai / openrouter [{current}]: ");
+        eprint!("Report CLI: codex / claude [{current}]: ");
         io::stderr().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
@@ -45,10 +45,10 @@ pub fn choose_provider(current: &str) -> Result<String> {
         if answer.is_empty() {
             return Ok(current.to_owned());
         }
-        if ["none", "openai", "openrouter"].contains(&answer) {
+        if ["codex", "claude"].contains(&answer) {
             return Ok(answer.to_owned());
         }
-        eprintln!("Choose none, openai, or openrouter.");
+        eprintln!("Choose codex or claude.");
     }
 }
 pub fn number(n: u64) -> String {
@@ -395,11 +395,16 @@ pub fn review_scope(s: &Value) -> String {
     if s["preliminary"] == true {
         return format!("Preliminary review of {selected} of {eligible} available patterns, sampled from {sessions} sessions. No pattern met the recurrence threshold of {} sessions. Suggestions are tentative and may not generalize.", s["recurrence_minimum_sessions"]);
     }
-    let mut line = format!("Reviewing {selected} of {eligible} eligible patterns, sampled from {sessions} sessions. Each pattern needs support from {} sessions.", s["minimum_sessions"]);
+    let mut line = format!("Reviewing {selected} of {eligible} eligible patterns, sampled from {sessions} sessions. Each project/category needs support from {} sessions.", s["minimum_sessions"]);
     if selected < eligible {
         line.push_str(
-            " The pattern limit bounds cost and context; use --top N or --all to expand it.",
+            " Use --top N or --all to expand selection, subject to review.max_investigations.",
         );
+    }
+    if let Some(budget) = s["max_investigations"].as_u64() {
+        line.push_str(&format!(
+            " Investigation budget: {budget}. Agents can retrieve more staged evidence."
+        ));
     }
     line
 }
@@ -506,11 +511,13 @@ pub fn review_report(data: &Value) -> String {
         },
     );
     if grounded.is_empty() {
-        if data["api_calls"].as_u64() == Some(0) {
+        if data["review_performed"] == false
+            || (data.get("review_performed").is_none() && data["api_calls"].as_u64() == Some(0))
+        {
             out.push_str("Model review was skipped. This report contains statistics only; no assessment of possible workflow improvements was made.\n\n");
         } else {
             out.push_str("No actionable recommendations in this review.\n\n");
-            if data["api_calls"].as_u64().is_some_and(|n| n > 0)
+            if data["review_performed"] == true
                 && text(data, "summary").trim().is_empty()
                 && !data["skipped_recommendations"]
                     .as_array()
@@ -573,11 +580,57 @@ pub fn review_report(data: &Value) -> String {
         }
         out.push('\n');
     }
-    if let Some(n) = data["api_calls"].as_u64() {
+    if let Some(findings) = data["findings"].as_array().filter(|a| !a.is_empty()) {
+        out.push_str("## Findings\n\n");
+        for finding in findings {
+            let _ = writeln!(out, "### {}\n", text(finding, "title"));
+            paragraph(&mut out, finding, "observation", "");
+            paragraph(&mut out, finding, "uncertainty", "Uncertainty: ");
+            if let Some(refs) = finding["supporting_refs"].as_array() {
+                for r in refs {
+                    let _ = writeln!(
+                        out,
+                        "- `jta show {} --turn {}`",
+                        text(r, "session_id"),
+                        r["turn_id"]
+                    );
+                }
+                out.push('\n');
+            }
+            if let Some(counterexamples) = finding["counterexamples"].as_array() {
+                for counterexample in counterexamples.iter().filter_map(Value::as_str) {
+                    let _ = writeln!(out, "- Counterexample: {counterexample}");
+                }
+                out.push('\n');
+            }
+        }
+    }
+    if let Some(n) = data["cli_invocations"].as_u64() {
         let _ = writeln!(
             out,
-            "Provider HTTP attempts: {n} (including retries and corrections).\n"
+            "CLI invocations: {n} (each can contain multiple model/tool turns).\n"
         );
+    }
+    if let Some(stages) = data["review_execution"]["stages"].as_array() {
+        out.push_str("## Investigation coverage and usage\n\n");
+        out.push_str("Inspection is reported by the agent and checked against available references. Available sessions were not necessarily reviewed. Cached usage belongs to the original run.\n\n");
+        out.push_str("| Stage | Cached | Inspected turns | Inspected files | Elapsed |\n| --- | --- | ---: | ---: | --- |\n");
+        for stage in stages {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                text(stage, "id"),
+                stage["cached"],
+                stage["coverage"]["inspected_refs"]
+                    .as_array()
+                    .map_or(0, Vec::len),
+                stage["coverage"]["inspected_files"]
+                    .as_array()
+                    .map_or(0, Vec::len),
+                duration(stage["elapsed_ms"].as_f64().unwrap_or(0.0))
+            );
+        }
+        out.push_str("\nCLI-reported token usage and any cost estimates are preserved per invocation in the JSON companion. Corpus token tables describe the original coding sessions.\n\n");
     }
     out
 }

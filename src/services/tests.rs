@@ -332,10 +332,10 @@ fn review_schema_and_reference_validation() {
     result["recommendations"][0]["supporting_refs"][0]["turn_id"] = json!(99);
     assert!(validate_review(&result, &evidence).is_err());
     let mut config = Config::default();
-    config.review.provider = "openrouter".into();
+    config.review.backend = "claude".into();
     let payload = prepare_review(&evidence, &config).unwrap();
-    assert_eq!(payload["provider"]["require_parameters"], true);
-    assert_eq!(payload["response_format"]["json_schema"]["strict"], true);
+    assert_eq!(payload["backend"], "claude");
+    assert_eq!(payload["schema"]["additionalProperties"], false);
 }
 fn server(responses: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -380,54 +380,6 @@ fn server(responses: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<Value
         requests
     });
     (format!("http://{address}/v1/systemone"), handle)
-}
-#[tokio::test]
-async fn review_repairs_once_and_revalidates_project_grounding() {
-    let evidence = json!({"isolated":true,"sessions":[{"session_id":"s_test","turns":[{"turn_id":2}]}],
-        "project_context":{"projects":[{"project_root":"/project","session_ids":["s_test"],
-        "files":[{"path":"/project/AGENTS.md","text":"Run npm test."}],"creation_targets":[]}]}});
-    let valid = json!({"recommendations":[{
-        "project_root":"/project","title":"Record the npm test result","observed_pattern":"Test outcome missing",
-        "outcome_effect":"Unverified result","supporting_refs":[{"session_id":"s_test","turn_id":2}],
-        "uncertainty":"Limited evidence","counterexamples":[],"remediation_surface":"AGENTS.md",
-        "proposed_change":"Record npm test result","scope":"This project","risk":"Extra reporting",
-        "evaluation_plan":"Check npm test outcome in the replay",
-        "targets":[{"path":"/project/AGENTS.md","action":"edit","before":"Run npm test.",
-            "after":"Run npm test and record its result.","rationale":"Make this project's existing check visible.",
-            "context_refs":[{"path":"/project/AGENTS.md","quote":"Run npm test."}]}]
-    }]});
-    let mut invalid = valid.clone();
-    invalid["recommendations"][0]["targets"][0]["context_refs"][0]["quote"] =
-        json!("Made up quote");
-    std::env::set_var("JTA_TEST_GROUNDED_REVIEW_KEY", "test-key");
-    for repaired in [true, false] {
-        let response = |value: &Value| json!({"choices":[{"finish_reason":"stop","message":{"content":value.to_string()}}]});
-        let (url, handle) = server(vec![
-            (200, response(&invalid)),
-            (200, response(if repaired { &valid } else { &invalid })),
-        ]);
-        let mut config = Config::default();
-        config.review.provider = "openai".into();
-        config.review.endpoint = url;
-        config.review.api_key_env = "JTA_TEST_GROUNDED_REVIEW_KEY".into();
-        let result = review(&evidence, &config).await;
-        if repaired {
-            assert_eq!(result.unwrap(), valid);
-        } else {
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("after one correction"));
-        }
-        let requests = handle.join().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1]["messages"].as_array().unwrap().len(), 4);
-        assert_eq!(requests[0]["messages"][1], requests[1]["messages"][1]);
-        assert!(requests[1]["messages"][3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("context_refs[0]"));
-    }
 }
 #[tokio::test]
 async fn http_contract_retries_rate_limit_and_preserves_payload() {
@@ -508,4 +460,36 @@ async fn session_progress_counts_validated_batches_not_retries_or_failed_respons
     })
     .await;
     assert_eq!(handle.join().unwrap().len(), 3);
+}
+
+#[test]
+fn agent_review_requires_inspection_and_rejects_partially_overlapping_edits() {
+    let evidence = json!({"sessions":[{"session_id":"s_test","turns":[{"turn_id":1}]}],
+        "project_context":{"projects":[{"project_root":"/project","session_ids":["s_test"],
+            "files":[{"path":"/project/AGENTS.md","text":"Run npm test before shipping."}],"creation_targets":[]}]}});
+    let recommendation = json!({"project_root":"/project","title":"Record results","observed_pattern":"Unclear result",
+        "outcome_effect":"Uncertain","supporting_refs":[{"session_id":"s_test","turn_id":1}],
+        "uncertainty":"Limited support","counterexamples":[],"remediation_surface":"AGENTS.md",
+        "proposed_change":"Record the check result","scope":"Project checks","risk":"Reporting overhead",
+        "evaluation_plan":"Replay and inspect the result","targets":[{"path":"/project/AGENTS.md","action":"edit",
+            "before":"Run npm test","after":"Run npm test and record its result","rationale":"Extend the existing check",
+            "context_refs":[{"path":"/project/AGENTS.md","quote":"Run npm test before shipping."}]}]});
+    let mut response = json!({"summary":"Make check results visible","themes":[],"findings":[],
+        "recommendations":[recommendation],"inspected_refs":[{"session_id":"s_test","turn_id":1}],
+        "inspected_files":["/project/AGENTS.md"]});
+    validate_agent_review(&response, &evidence, 1).unwrap();
+    let mut uninspected = response.clone();
+    uninspected["inspected_files"] = json!([]);
+    assert!(validate_agent_review(&uninspected, &evidence, 1).is_err());
+    let mut duplicate = response["recommendations"][0].clone();
+    duplicate["targets"][0]["before"] = json!("test before shipping.");
+    duplicate["targets"][0]["after"] = json!("test before shipping and record the result.");
+    response["recommendations"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    assert!(validate_agent_review(&response, &evidence, 1)
+        .unwrap_err()
+        .to_string()
+        .contains("overlapping"));
 }

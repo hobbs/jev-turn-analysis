@@ -49,7 +49,7 @@ or a `.env` file at the target project root before scoring. Then run:
 ```sh
 cd /path/to/your/codebase
 
-# Set up global API keys and choose an optional review provider.
+# Set up the Jev key and choose codex or claude for reports.
 jta init
 
 # Find and score this project's Codex and Claude Code sessions.
@@ -72,18 +72,17 @@ codebase's root. With `--workspace`, that explicit workspace's `.env` is used.
 Existing shell environment values take precedence. Use the source checkout's
 `.env.example` as a template and add the needed keys to your project's existing
 `.env`, or create one if absent. Keep `.env` out of version control; analysis data lives outside your checkout by default. Offline discovery, import, and previews need no key; analysis sends evidence to Jev.
-Report recommendations use the configured review provider; corpus statistics are
-available without one.
+Report investigations run through the selected `codex` or `claude` CLI.
+Install and authenticate that CLI separately. JTA only manages Jev authentication.
 
-Optional generative LLM review uses a separate credential: `OPENAI_API_KEY` for
-OpenAI or `OPENROUTER_API_KEY` for OpenRouter. To
-enable it, run `jta init --review-provider openai` (or `openrouter`) at any time.
-Supplied flags update existing configuration; unspecified settings are preserved.
-Run plain `jta init` in a terminal for a guided provider choice and credential check.
-Use `--no-input` in scripts. Interactive setup offers hidden key entry and saves
-credentials globally in `~/.jta/credentials.json` (or under `JTA_HOME`). Shell and
-project `.env` values override global keys. Saved keys stay out of project config
-and reports; the credentials file uses user-only permissions on macOS/Linux.
+Choose with `jta init --review-backend codex` (the default) or
+`jta init --review-backend claude`. Supplied flags update existing configuration;
+unspecified settings are preserved. Switching backends clears the optional model
+override unless `--review-model` is also supplied. Run plain `jta init` in a
+terminal for backend selection and hidden Jev key entry; use `--no-input` in scripts.
+The Jev key is stored globally in `~/.jta/credentials.json` (or under `JTA_HOME`).
+Shell and project `.env` values override the saved key. Keys stay out of project
+config and reports; the credentials file uses user-only permissions on Unix.
 
 ```sh
 # Follow a finding back to its turns and source events.
@@ -95,9 +94,8 @@ jta report --top 5
 jta recommendations
 ```
 
-You get useful diagnostics from `analyze` and `report` without a generative LLM.
-Jev supplies bounded semantic judgments; optional review explains causes and
-proposes improvements. See [validation results](../VALIDATION.md) for checks performed.
+Jev supplies categorical judgments for `analyze`. The report CLI investigates
+possible causes and proposes improvements. See [validation results](../VALIDATION.md) for checks performed.
 
 ## Start with the outcome
 
@@ -299,159 +297,105 @@ Every aggregate can be traced to contributing sessions and turns. Reports show t
 
 ## Review scope and reports
 
-`jta report` selects the top five eligible patterns by default to bound cost and
-context. The saved report gives selected versus eligible counts and the sampled session count.
-Use `--top N` to change the limit or `--all` to include all eligible patterns.
-These options count patterns, not recommendations or API calls. Session sampling
-and excerpt bounds still apply with `--all`.
+`jta report` selects five eligible **project × opportunity × remediation surface**
+groups by default. Recurrence is checked within each project. Categories associated
+with failed or partial tasks rank first, then verification gaps, then other
+opportunities; distinct supporting sessions break ties. Categories are starting
+points for investigation, not semantic clusters or causal explanations.
 
-A successful review saves a Markdown report in the data directory's `reports/`
-folder, including when there are no actionable suggestions. The path is printed
-and returned as `report_path` in JSON. `data_path` points to the JSON companion,
-which contains exact `statistics`, recommendations, filters, and source revisions.
-Neither output mode prints the report contents. Reports include statistics, a
-summary, themes, proposed edits, tradeoffs, evaluation steps, and original turn
-references. With no configured provider, reports explain why recommendations are
-unavailable. Provider failures remain errors. `purge` removes
-saved reports that retain expired session revisions.
+Use `--top N` or `--all` to expand selection, subject to the configured
+`review.max_investigations` cap (default 20). The report discloses selected,
+eligible, and omitted groups. A recurring proposal needs three distinct sessions
+by default. If no group qualifies, review falls back to preliminary findings with
+a one-session minimum. `--recurring-only` disables that fallback; `--session ID`
+explicitly investigates a single session, even without a detected opportunity.
 
-During analysis, the CLI shows cached sessions, planned Jev request batches,
-per-session progress, and actual HTTP attempts. Each active session gets a spinner,
-validated-batch progress bar, elapsed time, and in-place request/retry status, with
-an overall session counter below. Completed sessions leave one scored, cached,
-or failed result line. Report generation stays quiet and normally uses one review
-request, with at most one correction request after local validation. Each HTTP
-request can retry transient failures up to twice. The report records the attempt
-count. `--dry-run` explicitly previews the selection; `--dry-run --format json`
-prints the exact redacted payload and writes no report.
-
-## Turn repeated observations into proposals
-
-```console
-$ jta report --dry-run
-Selected for review
-  p_01  Missing verification       4 sessions · 11 turns
-  p_02  Repeated failed retries    3 sessions · 16 turns
-  p_03  Effective targeted tests   5 sessions · 14 turns
-
-Priority: failed or partial tasks, then correctness and verification
-gaps, then avoidable effort in successful tasks.
-
-LLM destination: configured review provider
-Payload: redacted excerpts, linked context, aggregate evidence, and project files
-No request sent.
+```sh
+jta report --top 10
+jta report --all
+jta report --session s_014
+jta report --recurring-only
+jta report --refresh
+jta report --dry-run --format json
 ```
 
-Initial pattern candidates come from Jev categories and deterministic grouping. LLM review can connect related candidates, inspect causes, and propose a narrowly scoped change. It receives the relevant source context as well as aggregate evidence.
+One CLI investigation runs per selected group, followed by a synthesis invocation.
+Initial samples contain up to `max(3, min_pattern_sessions)` supporting sessions
+plus a successful comparison when available. Each investigation gets excerpts,
+then can retrieve complete normalized sessions from the filtered project cohort
+and inspect current project snapshots. Turn filters choose investigation leads;
+other turns remain available as context and counterexamples. Statistics continue
+to follow the report filters.
 
-Review produces only project-grounded proposals for the coding agent's instructions,
-skills, tools, and orchestration. It reads current `AGENTS.md`, `AGENT.md`,
-`CLAUDE.md`, instruction overrides, Markdown rules, and `SKILL.md` files within the
-selected projects, plus ancestor instructions. It includes installed `SKILL.md`
-files referenced by absolute path in selected sessions, limited to the configured
-Codex/Claude skills and plugins directories and `~/.agents/skills`. Aliased skill
-catalog entries alone are not resolved. Project READMEs, package manifests, and
-Makefiles provide concrete commands and workflow context.
+The agent investigates specific behaviors, seeks counterexamples, and returns
+findings, uncertainty, and grounded proposals. Synthesis merges overlapping
+findings, ranks recommendations, and reconciles proposed edits. Agents cannot
+apply edits: Codex uses its read-only sandbox, and Claude gets only Read/Glob/Grep
+tools. Customizations and persistent agent sessions are disabled for report runs.
 
-Use repeatable `--context <file>` options for additional skills, tool definitions,
-or implementation files (paths are relative to the invocation directory). Explicit
-files are included for each selected project; use `--repo` to limit a multi-project
-workspace. Review does not load arbitrary source code by default.
+A successful run saves Markdown and JSON companions under `reports/`. Stdout
+contains the Markdown path, or `report_path` and `data_path` with `--format json`.
+Progress goes to stderr. CLI failures and invalid results fail the command;
+a successful empty recommendation list still retains findings and its explanation.
+No eligible investigations produces a local statistics report without a CLI call.
+
+## Evidence, validation, and caching
+
+Each temporary investigation directory has `initial.json`, an indexed
+`manifest.json`, session snapshots, and project-file snapshots. Original paths
+are citation identities; agents are instructed to read the staged copies. JTA
+applies its redaction rules to snapshots and saved outputs. Full normalized
+session snapshots let the agent inspect events omitted by initial excerpts.
+
+Automatic project discovery includes instructions, skills, rules, README files,
+package manifests, Makefiles, and common source files (Rust, Python, JavaScript,
+TypeScript, shell, Go, Ruby, Java, Kotlin, C/C++, C#, Swift, Markdown, and TOML).
+Applicable ancestor instructions and explicitly referenced installed skills are
+also included. Repeatable `--context FILE` arguments prioritize additional files;
+explicit files are associated with each selected project.
+
+Snapshots include at most 256 files and 8,388,608 characters per project. Files over
+256 KiB are skipped. Discovery stops at depth 12 and skips dependencies, build
+outputs, `.git`, `.jta`, and symlinks. Omitted files and characters are disclosed.
+These are current snapshots, not historical versions; existing fixes may postdate
+the sessions. The directory is staged evidence, not a complete filesystem read
+sandbox. Project files are not modified.
 
 ```sh
 jta report --context docs/harness.md --context src/server/orchestrator.ts --dry-run --format json
 ```
 
-Every proposal must name an exact project and file, provide a literal before/after
-edit, and cite both session turns and exact passages from inspected project files.
-Paths, existing passages, and quotations are validated before saving. Missing root
-`AGENTS.md` or `CLAUDE.md` files are explicit creation candidates; proposed new
-contents still require project-file evidence. A category-only suggestion such as
-"add a verification gate" is not accepted. If the evidence cannot support a
-project-specific edit, review returns no recommendations.
-If a response fails grounding validation, review makes at most one correction
-request with the validation error and checks the corrected response again. An
-invalid result is never saved; correction can incur a second provider request.
+Findings require project-scoped session/turn citations and can stand without an
+edit. Recommendations additionally require exact absolute file targets, unique
+before passages and literal replacements (or complete new root instruction files),
+exact project-file quotes, sufficient distinct-session support, scope, risk, and
+an evaluation plan. All citations must occur in the agent's inspection record.
+Overlapping edits fail validation. Inspection is self-reported; valid references
+alone do not prove an interpretation is correct.
 
-Snapshots contain at most 64 files, 16,000 characters per file, and 96,000 characters
-in total across selected projects. Discovery stops at depth 12, skips dependencies,
-build outputs and `.jta`, and does not follow project symlinks. Unreadable files,
-files above 256 KiB, and truncation are disclosed in the preview. Files are freshly
-redacted before sending. These are current files, not reconstructed historical
-versions; the prompt instructs review to account for fixes already present.
+Each stage may receive one correction invocation. The rejected answer and local
+validation error are provided alongside the same staged evidence. A second invalid
+answer fails the report. Useful observations should remain findings when an edit
+cannot be justified. No invalid recommendations are saved.
 
-```console
-$ jta recommendations
-r_01  Add the deck renderer to the export skill's completion check
+Validated stages are cached under `review_cache/` using staged evidence, project
+content, CLI version, configured model, instructions/schema, and budgets. Cached
+results are revalidated and incur zero new model invocations. `--refresh` bypasses
+caches, including after an unpinned model alias changes. `purge` removes cache
+entries and reports dependent on expired session revisions.
 
-Project: /work/deck-studio
+Default budgets are 600 seconds per invocation, 20 investigations per report, and
+8 MiB of captured CLI output. Investigations run sequentially. These are not hard
+token or dollar limits; every CLI invocation can include multiple model/tool calls.
+The JSON companion records reported usage, elapsed times, cache status, and
+coverage per stage, keeping cached historical usage separate from new execution.
+Corpus token tables describe the original sessions, not report processing.
 
-Edit: /work/deck-studio/.claude/skills/export/SKILL.md
-
-Replace this passage:
-
-    Run npm test before handing off the deck.
-
-With:
-
-    Run npm test before handing off the deck. For export changes, run
-    npx tsx scripts/render-deck.ts .generated/<presentation-id>.pptx
-    and inspect the slide PNGs in .artifacts/qa/ for required visible labels.
-    Report the deck ID and any missing labels; do not report those as verified.
-
-Why here: This skill owns deck handoff, but currently requires only unit tests.
-
-Project reference (/work/deck-studio/README.md): npx tsx scripts/render-deck.ts .generated/<presentation-id>.pptx
-
-Surface: skill
-
-Proposed change: Extend the export skill's existing npm test instruction with the
-project's render-deck command and a visible-label check.
-
-Applies to: Changes affecting exported artifacts.
-
-Observed behavior: Completion claims cited builds without an artifact check.
-
-Effect: Users had to discover unusable exports after handoff.
-
-How to evaluate: Replay representative export tasks. Every export-success claim
-must link an artifact that opens; track task completion and verification time.
-
-Risk: Extra export latency.
-
-Uncertainty: Excerpts may omit checks performed elsewhere.
-
-Original turns:
-  - jta show s_014 --turn 18
-  - jta show s_015 --turn 7
-  - jta show s_016 --turn 12
-
-$ jta show r_01
+```sh
+jta init --review-timeout-secs 300 --review-max-investigations 10
+jta recommendations
+jta show <recommendation-id>
 ```
-
-Each recommendation includes:
-
-- The observed pattern and its effect on task outcomes.
-- Supporting session and turn references, uncertainty, and counterexamples.
-- The proposed remediation surface and concrete suggested wording or behavior.
-- Exact target paths, literal edits or new-file contents, and project-file citations.
-- The scope where it should apply and the risk of applying it too broadly.
-- A way to evaluate whether the change improves future sessions.
-
-`jta report` writes these details to the Markdown file. `jta recommendations`
-displays saved proposals in the terminal.
-Older saved reviews without concrete file targets are flagged and omitted from
-the guidance; rerun `jta report` to generate grounded replacements. The old records
-remain available through `jta show <recommendation-id>` and `--format json`, which
-includes the full stored objects and source evidence. No proposed edits are applied.
-
-By default, harness recommendations use patterns supported by at least three distinct sessions. If no pattern qualifies, `jta report` reviews the available patterns and labels suggestions as preliminary. These suggestions require at least one supporting session and do not establish recurrence. Use `--recurring-only` to require the configured recurrence threshold, or `jta report --session s_014` to investigate one session explicitly.
-
-The review prompt includes this threshold for each proposal. Proposals citing too
-few distinct sessions are skipped with a warning; qualifying recommendations are
-still saved. If none qualify, use an isolated session review or gather more evidence.
-
-Recommendations remain proposals. `jta` never automatically edits `AGENTS.md`, installs skills, or changes runtime policy. You decide which changes to apply.
 
 ## Check whether a change helped
 
@@ -491,16 +435,16 @@ Without that override, credentials load from the target project's `.env`.
 Both modes fall back to keys saved globally by `jta init`.
 
 `analyze` and `import` initialize storage automatically. `init` is optional setup:
-it asks which review provider to use in an interactive terminal, shows credential
+it asks which report CLI to use in an interactive terminal, shows Jev credential
 readiness without printing keys, offers hidden key entry or saving existing
 environment keys globally, and updates only supplied settings. JSON output,
 redirected input, or `--no-input` disables questions. Jev defaults to
 `https://api.typesafe.ai/v1/systemone`, model `jev-latest`, and `JEV_API_KEY`.
 Override these with `--jev-endpoint`, `--jev-model`, and `--jev-api-key-env`.
 
-Import, normalization, evidence extraction, dependency linking, and aggregation run locally using deterministic code. No generative LLM summarizes or enriches turns during that pipeline. Jev performs the first semantic pass, returning categories and their probabilities. Only `review` invokes a generative LLM.
+Import, normalization, evidence extraction, dependency linking, and aggregation run locally using deterministic code. No generative LLM summarizes or enriches turns during that pipeline. Jev performs the first semantic pass, returning categories and their probabilities. Only `report` launches generative investigations through the selected CLI.
 
-When configured services are remote, `analyze` sends scoring context to Jev and `review` sends selected context to the LLM provider. Both commands support `--dry-run` to inspect the destination and prepared payload before sending it. There is no background upload or automatic LLM review.
+When configured services are remote, `analyze` sends scoring context to Jev; the report CLI sends the staged context it reads to its model service. Both commands support `--dry-run` to inspect scoring payloads or the report plan without launching remote work. There is no background analysis.
 
 Redaction runs before evidence is persisted or sent to a service. Built-in secret detection and user-defined patterns are supported; no redactor can guarantee removal of every sensitive value. Stable placeholders preserve relationships between repeated values. Original source logs are not modified or copied into the workspace; retained evidence can still contain source code and personal data.
 
@@ -609,11 +553,10 @@ The configuration is editable JSON with these defaults:
     "timeout_secs": 120
   },
   "review": {
-    "provider": "none",
-    "endpoint": "https://api.openai.com/v1/chat/completions",
-    "api_key_env": "OPENAI_API_KEY",
-    "model": "gpt-5.6-terra",
-    "timeout_secs": 120
+    "backend": "codex",
+    "model": null,
+    "timeout_secs": 600,
+    "max_investigations": 20
   },
   "redaction": {"enabled": true, "patterns": []},
   "retention_days": 90,
@@ -621,15 +564,13 @@ The configuration is editable JSON with these defaults:
 }
 ```
 
-Configure optional review with `jta init --review-provider openai`, or
-`jta init --review-provider openrouter` (defaults to `OPENROUTER_API_KEY` and
-model `openai/gpt-4.1`). This also works after analysis. Run `jta init --no-input`
-to see the data directory and credential readiness. Endpoint, model, and
-key-variable flags override provider defaults.
-
-If review is not configured, choose a provider with `init` and save its API key when
-prompted, or set it in the project `.env` or shell. `jta report --dry-run` previews the selection;
-`--format json` includes the full redacted request.
+Configure reports with `jta init --review-backend codex` or `claude`.
+`--review-model` optionally overrides the CLI model; an empty value clears it.
+Use `--review-timeout-secs` and `--review-max-investigations` to change budgets.
+Only Jev has endpoint and API-key-variable settings. Older HTTP review settings
+are ignored when loading configuration and replaced with Codex defaults;
+`jta init` persists the migrated configuration. Retired review credentials are
+never resolved or requested. Existing credential files are not deleted.
 
 Custom redaction patterns are regular expressions. Matching values use stable hashed
 placeholders. Review the dry-run payload before sharing confidential transcripts;

@@ -54,7 +54,7 @@ pub struct DiscoveryArgs {
 }
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Set up API keys and project preferences; supplied flags update existing settings.
+    /// Set up the Jev API key and project preferences; supplied flags update existing settings.
     Init {
         /// Use defaults and flags without asking questions.
         #[arg(long)]
@@ -65,14 +65,14 @@ pub enum Command {
         jev_api_key_env: Option<String>,
         #[arg(long)]
         jev_model: Option<String>,
-        #[arg(long)]
-        review_provider: Option<String>,
-        #[arg(long)]
-        review_endpoint: Option<String>,
+        #[arg(long, value_parser = ["codex", "claude"])]
+        review_backend: Option<String>,
         #[arg(long)]
         review_model: Option<String>,
         #[arg(long)]
-        review_api_key_env: Option<String>,
+        review_timeout_secs: Option<u64>,
+        #[arg(long)]
+        review_max_investigations: Option<usize>,
         #[arg(long)]
         retention_days: Option<u32>,
         #[arg(long)]
@@ -118,7 +118,7 @@ pub enum Command {
         /// Review this many priority patterns (default: 5, to bound cost and context).
         #[arg(long, conflicts_with_all = ["all", "session"], value_parser = clap::value_parser!(u32).range(1..))]
         top: Option<u32>,
-        /// Include every eligible pattern; may send a much larger request.
+        /// Investigate every eligible project/category, up to the configured budget.
         #[arg(long, conflicts_with = "session")]
         all: bool,
         /// Skip preliminary review when no pattern meets the recurrence threshold.
@@ -129,6 +129,9 @@ pub enum Command {
         /// Include an additional instruction, skill, or implementation file in review context.
         #[arg(long = "context", value_name = "FILE")]
         context: Vec<PathBuf>,
+        /// Re-run investigations and synthesis instead of using cached results.
+        #[arg(long)]
+        refresh: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -296,10 +299,10 @@ async fn execute_inner(cli: Cli) -> Result<i32> {
         jev_endpoint,
         jev_api_key_env,
         jev_model,
-        mut review_provider,
-        review_endpoint,
+        mut review_backend,
         review_model,
-        review_api_key_env,
+        review_timeout_secs,
+        review_max_investigations,
         retention_days,
         min_pattern_sessions,
         redact_pattern,
@@ -315,13 +318,13 @@ async fn execute_inner(cli: Cli) -> Result<i32> {
         if !no_input
             && matches!(format, Format::Text)
             && ui::interactive()
-            && review_provider.is_none()
+            && review_backend.is_none()
         {
             eprintln!(
                 "Set up this project. Press Enter to keep the current choice.\nData: {}",
                 w.data_dir().display()
             );
-            review_provider = Some(ui::choose_provider(&c.review.provider)?);
+            review_backend = Some(ui::choose_backend(&c.review.backend)?);
         }
         if let Some(v) = retention_days {
             c.retention_days = v;
@@ -338,28 +341,22 @@ async fn execute_inner(cli: Cli) -> Result<i32> {
         if let Some(v) = jev_model {
             c.jev.model = v;
         }
-        if let Some(v) = review_provider {
-            if v == "openai" && c.review.provider != "openai" {
-                c.review = config::ReviewConfig::default();
+        if let Some(v) = review_backend {
+            if c.review.backend != v {
+                c.review.model = None;
             }
-            if v == "openrouter" && c.review.provider != "openrouter" {
-                c.review.endpoint = "https://openrouter.ai/api/v1/chat/completions".into();
-                c.review.api_key_env = "OPENROUTER_API_KEY".into();
-                c.review.model = "openai/gpt-4.1".into();
-            } else if v != "openai" && v != "none" && v != "openrouter" {
-                bail!("configuration: unsupported review provider");
-            }
-            c.review.provider = v;
-        }
-        if let Some(v) = review_endpoint {
-            c.review.endpoint = v;
+            c.review.backend = v;
         }
         if let Some(v) = review_model {
-            c.review.model = v;
+            c.review.model = (!v.trim().is_empty()).then_some(v);
         }
-        if let Some(v) = review_api_key_env {
-            c.review.api_key_env = v;
+        if let Some(v) = review_timeout_secs {
+            c.review.timeout_secs = v;
         }
+        if let Some(v) = review_max_investigations {
+            c.review.max_investigations = v;
+        }
+        services::validate_review_config(&c)?;
         if no_redaction {
             c.redaction.enabled = false;
         }
@@ -375,9 +372,6 @@ async fn execute_inner(cli: Cli) -> Result<i32> {
             );
             eprintln!("Shell and project .env values override saved keys.");
             crate::credentials::prompt(&c.jev.api_key_env, "Jev")?;
-            if c.review.provider != "none" && c.review.api_key_env != c.jev.api_key_env {
-                crate::credentials::prompt(&c.review.api_key_env, &c.review.provider)?;
-            }
         }
         emit(
             format,
@@ -385,7 +379,7 @@ async fn execute_inner(cli: Cli) -> Result<i32> {
             json!({"root":w.root,"data_dir":w.data_dir(),"configuration":c,
             "credentials_file":crate::credentials::path().ok(),
             "jev_key_ready":crate::credentials::resolve(&c.jev.api_key_env)?.is_some(),
-            "review_key_ready":crate::credentials::resolve(&c.review.api_key_env)?.is_some()}),
+            "review_authentication":"Managed by the selected CLI; JTA only stores Jev credentials"}),
         )?;
         return Ok(0);
     }
@@ -646,14 +640,26 @@ async fn execute_inner(cli: Cli) -> Result<i32> {
                     json!({"session":session,"analysis":analysis,"prepared_evidence":if evidence{Some(services::prepare_analysis(&session,&c)?)}else{None}})
                 }
             } else if id.starts_with("p_") {
-                let p = analytics::patterns(&pairs(
+                let corpus = pairs(
                     &w,
                     &Filters {
                         run,
                         ..Filters::default()
                     },
-                )?);
-                serde_json::to_value(p.iter().find(|p| p.id == id).context("pattern not found")?)?
+                )?;
+                let patterns = analytics::patterns(&corpus);
+                if let Some(pattern) = patterns.iter().find(|p| p.id == id) {
+                    serde_json::to_value(pattern)?
+                } else {
+                    let patterns =
+                        crate::review_pipeline::project_patterns(patterns, &corpus, &w.root);
+                    serde_json::to_value(
+                        patterns
+                            .iter()
+                            .find(|p| p.id == id)
+                            .context("pattern not found")?,
+                    )?
+                }
             } else {
                 let collection = if id.starts_with("run_") {
                     "runs"
@@ -673,6 +679,7 @@ async fn execute_inner(cli: Cli) -> Result<i32> {
             recurring_only,
             session,
             context,
+            refresh,
             dry_run,
         } => {
             let (mut p, unscored) = pairs_and_unscored(&w, &filters)?;
@@ -689,8 +696,11 @@ async fn execute_inner(cli: Cli) -> Result<i32> {
                 .iter()
                 .map(|(s, _)| json!({"session_id":s.id,"revision":s.revision}))
                 .collect::<Vec<_>>();
-            let candidates =
-                serde_json::from_value::<Vec<analytics::Pattern>>(statistics["patterns"].clone())?;
+            let candidates = crate::review_pipeline::project_patterns(
+                serde_json::from_value::<Vec<analytics::Pattern>>(statistics["patterns"].clone())?,
+                &p,
+                &w.root,
+            );
             let recurrence_minimum = c.min_pattern_sessions.max(1);
             let preliminary = session.is_none()
                 && !recurring_only
@@ -711,205 +721,90 @@ async fn execute_inner(cli: Cli) -> Result<i32> {
             } else {
                 top.unwrap_or(5) as usize
             };
-            let patterns = eligible.into_iter().take(limit).collect::<Vec<_>>();
-            if session.is_none() {
-                let mut sampled = BTreeSet::new();
-                for pattern in &patterns {
-                    let support = pattern
-                        .supporting
-                        .iter()
-                        .filter_map(|r| r["session_id"].as_str())
-                        .collect::<BTreeSet<_>>();
-                    let mut candidates = p
-                        .iter()
-                        .filter(|(s, _)| support.contains(s.id.as_str()))
-                        .collect::<Vec<_>>();
-                    candidates.sort_by_key(|(s, a)| {
-                        let outcome = a.session.get("task_outcome").map(|d| d.selected.as_str());
-                        let verification = a
-                            .session
-                            .get("outcome_verification")
-                            .map(|d| d.selected.as_str());
-                        (
-                            if matches!(outcome, Some("failed" | "partially_complete")) {
-                                0
-                            } else if verification == Some("claimed_but_unverified") {
-                                1
-                            } else {
-                                2
-                            },
-                            s.id.clone(),
-                        )
-                    });
-                    let limit = c.min_pattern_sessions.max(3);
-                    let mut chosen = candidates
-                        .iter()
-                        .take(limit)
-                        .map(|(s, _)| s.id.clone())
-                        .collect::<Vec<_>>();
-                    if let Some((s, _)) = candidates.iter().find(|(_, a)| {
-                        a.session
-                            .get("task_outcome")
-                            .is_some_and(|d| d.selected == "complete")
-                    }) {
-                        if !chosen.contains(&s.id) && chosen.len() == limit {
-                            chosen.pop();
-                            chosen.push(s.id.clone());
-                        }
-                    }
-                    sampled.extend(chosen);
-                }
-                p.retain(|(s, _)| sampled.contains(&s.id));
-            }
+            let patterns = eligible
+                .into_iter()
+                .take(limit.min(c.review.max_investigations))
+                .collect::<Vec<_>>();
+            let plan = crate::review_pipeline::Plan::new(
+                &p,
+                &patterns,
+                &w.root,
+                &context,
+                &c,
+                session.is_some(),
+                preliminary,
+            )?;
             let selection = json!({"eligible_patterns":eligible_count,"selected_patterns":patterns.len(),
-                "sampled_sessions":p.len(),"minimum_sessions":minimum_sessions,
+                "sampled_sessions":plan.sampled_sessions,"minimum_sessions":minimum_sessions,
+                "available_sessions":plan.evidence["sessions"].as_array().map_or(0, Vec::len),
+                "investigations":plan.investigations.len(),"max_investigations":c.review.max_investigations,
+                "omitted_patterns":eligible_count.saturating_sub(patterns.len()),
                 "preliminary":preliminary,"recurrence_minimum_sessions":recurrence_minimum,
-                "isolated":session.is_some(),"limit":if all || session.is_some(){None}else{Some(limit)}});
-            let mut evidence = review_evidence(&p, &patterns, session.is_some());
-            evidence["preliminary"] = json!(preliminary);
-            evidence["project_context"] =
-                crate::review_context::collect(&w.root, &p, &context, &c)?;
-            crate::redact::Redactor::new(&c.redaction)?.value(&mut evidence);
+                "isolated":session.is_some(),"limit":if all || session.is_some(){None}else{Some(limit)},
+                "grouping":"project × opportunity × remediation surface"});
             if dry_run {
-                emit(
-                    format,
-                    "review_preview",
-                    json!({"destination":c.review.endpoint,"provider":c.review.provider,"selection":selection,"request":services::prepare_review(&evidence,&c)?}),
-                )?;
-            } else if p.is_empty() {
+                let mut preview = plan.preview(&c)?;
+                preview["selection"] = selection;
+                emit(format, "review_preview", preview)?;
+            } else if plan.investigations.is_empty() {
                 finish_review(
                     &w,
                     format,
-                    json!({"recommendations":[],"selection":selection,"api_calls":0,
+                    json!({"recommendations":[],"findings":[],"selection":selection,
+                    "review_performed":false,"cli_invocations":0,
                     "message":if statistics["sessions"].as_u64() == Some(0) {
-                        "No analyzed sessions match this report. Run jta analyze or adjust the report filters. No API request sent."
+                        "No analyzed sessions match this report. Run jta analyze or adjust the report filters. No CLI launched."
                     } else if recurring_only {
-                        "No patterns meet the recurrence threshold. Run jta report without --recurring-only for a preliminary review, or analyze more sessions. No API request sent."
+                        "No project/category meets the recurrence threshold. Run jta report without --recurring-only for a preliminary review. No CLI launched."
                     } else {
-                        "No opportunity patterns match this report. Adjust the report filters or use jta report --session <id> for one analyzed session. No API request sent."
+                        "No opportunity patterns match this report. Adjust the filters or use --session <id>. No CLI launched."
                     }}),
                     &statistics,
                     &sources,
                     &filters,
                 )?;
-            } else if !evidence["project_context"]["projects"]
-                .as_array()
-                .is_some_and(|projects| {
-                    projects
-                        .iter()
-                        .any(|p| p["files"].as_array().is_some_and(|files| !files.is_empty()))
-                })
-            {
-                finish_review(
-                    &w,
-                    format,
-                    json!({"recommendations":[],"selection":selection,"api_calls":0,
-                    "message":"No readable project files available to ground recommendations. Restore the selected project or supply --context <file>. No LLM request sent."}),
-                    &statistics,
-                    &sources,
-                    &filters,
-                )?;
-            } else if c.review.provider == "none" {
-                finish_review(
-                    &w,
-                    format,
-                    json!({"recommendations":[],"selection":selection,"api_calls":0,
-                    "message":"Recommendations are unavailable because no review provider is configured. Run jta init to choose OpenAI or OpenRouter, then generate the report again. No API request sent."}),
-                    &statistics,
-                    &sources,
-                    &filters,
-                )?;
             } else {
-                if preliminary && !matches!(format, Format::Json) {
-                    eprintln!("{}", ui::review_scope(&selection));
-                }
-                let result = services::review(&evidence, &c).await.with_context(|| {
-                    format!(
-                        "Review failed using configuration {}",
-                        w.data_dir().join("config.json").display()
-                    )
-                })?;
-                let mut saved = vec![];
-                let mut skipped = vec![];
-                let mut warnings = vec![];
-                for (index, proposal) in result["recommendations"]
-                    .as_array()
-                    .context("review response missing recommendations")?
-                    .iter()
-                    .enumerate()
+                let mut result = crate::review_pipeline::review(&plan, &c, &w, refresh)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Review failed using configuration {}",
+                            w.data_dir().join("config.json").display()
+                        )
+                    })?;
+                for v in result["recommendations"]
+                    .as_array_mut()
+                    .context("Missing recommendations")?
                 {
-                    let mut v = proposal.clone();
-                    let refs = v["supporting_refs"]
-                        .as_array()
-                        .context("missing supporting_refs")?;
-                    let mut support = BTreeSet::new();
-                    for r in refs {
-                        let sid = r["session_id"]
-                            .as_str()
-                            .context("invalid session reference")?;
-                        let tid = r["turn_id"].as_u64().context("invalid turn reference")?;
-                        if !evidence["sessions"].as_array().is_some_and(|sessions| {
-                            sessions.iter().any(|s| {
-                                s["session_id"] == sid
-                                    && s["turns"].as_array().is_some_and(|turns| {
-                                        turns.iter().any(|t| t["turn_id"] == tid)
-                                    })
-                            })
-                        }) {
-                            bail!("review contains unsupported evidence reference");
-                        }
-                        support.insert(sid.to_owned());
-                    }
-                    if support.len() < minimum_sessions {
-                        skipped.push(json!({"index":index + 1,"supporting_sessions":support.len(),"required_sessions":minimum_sessions,"reason":"insufficient_session_support"}));
-                        warnings.push(format!(
-                            "Skipped recommendation {}: cites {} distinct sessions; at least {} required",
-                            index + 1, support.len(), minimum_sessions
-                        ));
-                        continue;
-                    }
                     let id = identifier("r");
                     v["id"] = json!(id);
                     v["isolated"] = json!(session.is_some());
                     v["preliminary"] = json!(preliminary);
-                    v["supporting_sessions"] = json!(support.len());
-                    v["grounding_version"] = json!(1);
+                    v["supporting_sessions"] = json!(v["supporting_refs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|r| r["session_id"].as_str())
+                        .collect::<BTreeSet<_>>()
+                        .len());
+                    v["grounding_version"] = json!(2);
                     v["created_at"] = json!(now());
-                    v["source_evidence"] = evidence.clone();
+                    v["source_evidence"] = plan.evidence.clone();
                     v["agents"] = json!(p
                         .iter()
                         .map(|(s, _)| s.agent.clone())
                         .collect::<BTreeSet<_>>());
-                    v["project_roots"] = json!(p
-                        .iter()
-                        .filter_map(|(s, _)| s.project_root.clone())
-                        .collect::<BTreeSet<_>>());
-                    crate::redact::Redactor::new(&c.redaction)?.value(&mut v);
-                    saved.push(v);
+                    v["project_roots"] = json!([v["project_root"]]);
                 }
-                for v in &saved {
-                    w.save_json(
-                        "recommendations",
-                        v["id"].as_str().context("missing recommendation id")?,
-                        v,
-                    )?;
+                result["selection"] = selection;
+                crate::redact::Redactor::new(&c.redaction)?.value(&mut result);
+                for v in result["recommendations"].as_array().unwrap() {
+                    w.save_json("recommendations", v["id"].as_str().unwrap(), v)?;
                 }
-                let mut output = json!({"recommendations":saved,"skipped_recommendations":skipped,"warnings":warnings,"selection":selection,"api_calls":ui::requests()});
-                if saved.is_empty() && !skipped.is_empty() {
-                    output["message"] = json!("No recommendations met the recurrence threshold. Use jta report --session <session-id> to review an isolated finding.");
-                } else if saved.is_empty() {
-                    output["message"] = json!("No project-specific edits were supported by the selected sessions and current project files.");
-                }
-                // An empty model result can still explain why no edit was justified.
-                // Suppress prose only when local filtering rejected proposals it may describe.
-                if skipped.is_empty() {
-                    output["summary"] = result["summary"].clone();
-                    output["themes"] = result["themes"].clone();
-                }
-                crate::redact::Redactor::new(&c.redaction)?.value(&mut output);
-                finish_review(&w, format, output, &statistics, &sources, &filters)?;
+                finish_review(&w, format, result, &statistics, &sources, &filters)?;
             }
         }
+
         Command::Recommendations => emit(
             format,
             "recommendations",
@@ -1283,21 +1178,11 @@ fn compact(kind: &str, data: &Value, format: Format) -> bool {
                 }
             );
             println!(
-                "Review provider: {}",
-                data["configuration"]["review"]["provider"]
+                "Report CLI: {} (authentication managed by the CLI)",
+                data["configuration"]["review"]["backend"]
                     .as_str()
-                    .unwrap_or("none")
+                    .unwrap_or("codex")
             );
-            if data["configuration"]["review"]["provider"] != "none"
-                && data["review_key_ready"] != true
-            {
-                println!(
-                    "Run jta init to save {}, or set it in your shell/project .env.",
-                    data["configuration"]["review"]["api_key_env"]
-                        .as_str()
-                        .unwrap_or("?")
-                );
-            }
             println!("\nNext: jta analyze     (or jta analyze --dry-run to preview)");
             true
         }
@@ -1324,11 +1209,14 @@ fn compact(kind: &str, data: &Value, format: Format) -> bool {
         "review_preview" => {
             println!("{}", ui::review_scope(&data["selection"]));
             println!(
-                "Destination: {} · {}",
-                data["provider"].as_str().unwrap_or("none"),
-                data["destination"].as_str().unwrap_or("?")
+                "Report CLI: {} · {} investigations plus synthesis · {}s per invocation",
+                data["backend"],
+                data["selection"]["investigations"],
+                data["timeout_secs_per_invocation"]
             );
-            println!("No requests sent. Use --format json to inspect the full redacted payload.");
+            println!(
+                "No CLI launched. Use --format json to inspect the evidence and task contract."
+            );
             true
         }
         "discovery" => {
@@ -1490,7 +1378,7 @@ fn excerpt(value: &str, limit: usize) -> Value {
     let text = value.chars().take(limit).collect::<String>();
     json!({"text":text,"omitted_chars":value.chars().count().saturating_sub(limit)})
 }
-fn review_evidence(
+pub(crate) fn review_evidence(
     pairs: &[(Session, Analysis)],
     patterns: &[analytics::Pattern],
     isolated: bool,

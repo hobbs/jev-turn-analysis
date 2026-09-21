@@ -11,21 +11,15 @@ fn main() {
     let config = Config::default();
     let review = services::prepare_review(&json!({"isolated":false}), &config).unwrap();
     println!(
-        "Recommendation system prompt: {} characters (includes Humanizer)",
-        review["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .chars()
-            .count()
+        "CLI investigation instructions: {} characters",
+        review["prompt"].as_str().unwrap().chars().count()
     );
     println!(
-        "Recommendation response format/schema: {} serialized characters",
-        review["response_format"].to_string().chars().count()
+        "CLI output schema: {} characters",
+        review["schema"].to_string().chars().count()
     );
-    println!(
-        "Recommendation completion limit: {} tokens for the whole response",
-        review["max_completion_tokens"]
-    );
+    println!("Report runs one CLI investigation per selected project/category plus synthesis, with cached stages reused.");
+    println!("CLI token usage depends on retrieved evidence and tool turns; it is recorded per invocation.");
     for (name, text, expected_requests) in [
         ("minimal", String::new(), 32),
         (

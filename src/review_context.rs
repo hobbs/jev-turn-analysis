@@ -14,10 +14,10 @@ use std::{
 };
 use walkdir::WalkDir;
 
-const MAX_FILES: usize = 64;
+const MAX_FILES: usize = 256;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
-const MAX_FILE_CHARS: usize = 16000;
-const MAX_TOTAL_CHARS: usize = 96000;
+const MAX_FILE_CHARS: usize = 256 * 1024;
+const MAX_TOTAL_CHARS: usize = 8 * 1024 * 1024;
 
 fn artifact_kind(path: &Path) -> Option<&'static str> {
     match path.file_name()?.to_str()? {
@@ -32,6 +32,34 @@ fn artifact_kind(path: &Path) -> Option<&'static str> {
             && path.components().any(|c| c.as_os_str() == "rules") =>
         {
             Some("instructions")
+        }
+        _ if path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            matches!(
+                e,
+                "rs" | "py"
+                    | "ts"
+                    | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "mjs"
+                    | "cjs"
+                    | "sh"
+                    | "bash"
+                    | "go"
+                    | "rb"
+                    | "java"
+                    | "kt"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "cs"
+                    | "swift"
+                    | "md"
+                    | "toml"
+            )
+        }) =>
+        {
+            Some("implementation")
         }
         _ => None,
     }
@@ -181,8 +209,17 @@ pub fn collect(
             candidates.insert(path.clone(), "explicit_context");
         }
         let mut ordered = candidates.into_iter().collect::<Vec<_>>();
-        ordered
-            .sort_by_key(|(path, kind)| (usize::from(*kind == "project_reference"), path.clone()));
+        ordered.sort_by_key(|(path, kind)| {
+            (
+                match *kind {
+                    "explicit_context" => 0,
+                    "project_reference" => 2,
+                    "implementation" => 3,
+                    _ => 1,
+                },
+                path.clone(),
+            )
+        });
         let mut files = Vec::new();
         let mut omitted_files = 0;
         for (path, kind) in ordered {
@@ -264,6 +301,7 @@ mod tests {
         for (path, text) in [
             ("AGENT.md", "Project instruction"),
             ("src/nested/CLAUDE.md", "Nested instruction"),
+            ("src/runtime.rs", "fn check_harness() {}"),
             (".claude/skills/export/SKILL.md", "Export named skill"),
             (".claude/rules/export.md", "Project export rule"),
             (
@@ -282,6 +320,7 @@ mod tests {
             "Parent instruction",
             "Project instruction",
             "Nested instruction",
+            "fn check_harness() {}",
             "Export named skill",
             "Project export rule",
             "scripts/render-deck.ts",
@@ -335,7 +374,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         fs::create_dir(&project).unwrap();
-        fs::write(project.join("AGENTS.md"), "α".repeat(MAX_FILE_CHARS + 25)).unwrap();
+        fs::write(project.join("AGENTS.md"), "a".repeat(MAX_FILE_CHARS - 25)).unwrap();
         let extra = temp.path().join("orchestrator.ts");
         fs::write(&extra, "export function finalize() {}").unwrap();
         let context = collect(
@@ -352,9 +391,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             bounded["text"].as_str().unwrap().chars().count(),
-            MAX_FILE_CHARS
+            MAX_FILE_CHARS - 25
         );
-        assert_eq!(bounded["omitted_chars"], 25);
+        assert_eq!(bounded["omitted_chars"], 0);
         assert!(files
             .iter()
             .any(|f| f["text"] == "export function finalize() {}"));

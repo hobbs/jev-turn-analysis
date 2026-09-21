@@ -1,6 +1,7 @@
-//! Bounded evidence packets and verified TypeSafe/OpenAI-compatible HTTP contracts.
+//! Jev scoring and read-only coding-agent CLI investigations.
 mod packets;
 mod review;
+mod review_cli;
 mod rubric;
 mod transport;
 use crate::{
@@ -9,7 +10,9 @@ use crate::{
 };
 use anyhow::{bail, ensure, Context, Result};
 pub use packets::evidence_packet;
-pub use review::{prepare_review, review, validate_review};
+pub(crate) use review::validate_agent_review;
+pub use review::{prepare_review, validate_review, validate_review_config};
+pub(crate) use review_cli::{cli_version, run_cli};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 

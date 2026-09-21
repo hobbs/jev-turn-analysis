@@ -118,6 +118,8 @@ fn selected(a: &Analysis, q: &str) -> String {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pattern {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
     pub id: String,
     pub opportunity: String,
     pub surface: String,
@@ -184,6 +186,7 @@ pub fn patterns(pairs: &[(Session, Analysis)]) -> Vec<Pattern> {
                 .map(|(agent, sessions)| (agent, sessions.len()))
                 .collect();
             Pattern {
+                project_root: None,
                 id,
                 opportunity,
                 surface,

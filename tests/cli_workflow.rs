@@ -15,10 +15,31 @@ fn invoke(root: &std::path::Path, args: &[&str]) -> Output {
         .arg("--workspace")
         .arg(root)
         .args(args)
+        .env("PATH", fake_path(root))
         .arg("--format")
         .arg("json")
         .output()
         .unwrap()
+}
+fn fake_path(root: &std::path::Path) -> std::ffi::OsString {
+    let bin = root.join(".jta/test-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["codex", "claude"] {
+        let path = bin.join(name);
+        if !path.exists() {
+            std::fs::write(&path, include_str!("support/fake_review_cli.py")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).unwrap()
 }
 fn data(o: Output) -> Value {
     assert!(
@@ -29,11 +50,6 @@ fn data(o: Output) -> Value {
     serde_json::from_slice::<Value>(&o.stdout).unwrap()["data"].clone()
 }
 fn report_data(output: Output) -> Value {
-    assert!(
-        output.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let receipt = data(output);
     assert_eq!(receipt.as_object().unwrap().len(), 2);
     assert!(receipt["report_path"].as_str().unwrap().ends_with(".md"));
@@ -80,6 +96,7 @@ fn saved_recommendations_expose_action_and_evaluation_in_readable_formats() {
         let output = Command::new(env!("CARGO_BIN_EXE_jta"))
             .arg("--workspace")
             .arg(temp.path())
+            .env("PATH", fake_path(temp.path()))
             .args(["recommendations", "--format", format])
             .output()
             .unwrap();
@@ -120,6 +137,7 @@ fn legacy_generic_recommendations_are_retained_but_not_presented_as_guidance() {
     let output = Command::new(env!("CARGO_BIN_EXE_jta"))
         .arg("--workspace")
         .arg(temp.path())
+        .env("PATH", fake_path(temp.path()))
         .arg("recommendations")
         .output()
         .unwrap();
@@ -287,19 +305,12 @@ fn offline_lifecycle_cache_snapshot_labels_purge() {
     assert!(w.list_json::<Value>("labels").unwrap().is_empty());
 }
 #[test]
-fn init_openrouter_and_invalid_args() {
+fn init_claude_and_invalid_args() {
     let temp = tempfile::tempdir().unwrap();
-    data(invoke(
-        temp.path(),
-        &["init", "--review-provider", "openrouter"],
-    ));
+    data(invoke(temp.path(), &["init", "--review-backend", "claude"]));
     let w = Workspace::discover(Some(temp.path())).unwrap();
     let c = w.config().unwrap();
-    assert_eq!(c.review.api_key_env, "OPENROUTER_API_KEY");
-    assert_eq!(
-        c.review.endpoint,
-        "https://openrouter.ai/api/v1/chat/completions"
-    );
+    assert_eq!(c.review.backend, "claude");
     assert_eq!(
         invoke(temp.path(), &["analyze", "--all", "--project", "."])
             .status
@@ -313,19 +324,14 @@ fn init_openrouter_and_invalid_args() {
         Some(2)
     );
     let preview = data(invoke(temp.path(), &["report", "--dry-run"]));
-    assert_eq!(preview["provider"], "openrouter");
+    assert_eq!(preview["backend"], "claude");
 }
 #[test]
 fn small_corpus_defaults_to_preliminary_review_with_strict_opt_out() {
     let temp = tempfile::tempdir().unwrap();
     seed(temp.path());
     let preview = data(invoke(temp.path(), &["report", "--dry-run"]));
-    let evidence: Value = serde_json::from_str(
-        preview["request"]["messages"][1]["content"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
+    let evidence = preview["investigations"][0]["initial"].clone();
     assert_eq!(evidence["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(evidence["preliminary"], true);
     assert_eq!(preview["selection"]["minimum_sessions"], 1);
@@ -336,7 +342,7 @@ fn small_corpus_defaults_to_preliminary_review_with_strict_opt_out() {
     assert_eq!(strict["selection"]["sampled_sessions"], 0);
     assert_eq!(strict["selection"]["preliminary"], false);
     let skipped = report_data(invoke(temp.path(), &["report", "--recurring-only"]));
-    assert_eq!(skipped["api_calls"], 0);
+    assert_eq!(skipped["cli_invocations"], 0);
     assert!(skipped["message"]
         .as_str()
         .unwrap()
@@ -345,12 +351,7 @@ fn small_corpus_defaults_to_preliminary_review_with_strict_opt_out() {
         temp.path(),
         &["report", "--session", "s_test", "--dry-run"],
     ));
-    let evidence: Value = serde_json::from_str(
-        preview["request"]["messages"][1]["content"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
+    let evidence = preview["investigations"][0]["initial"].clone();
     assert_eq!(evidence["isolated"], true);
     assert_eq!(evidence["preliminary"], false);
     assert_eq!(evidence["sessions"].as_array().unwrap().len(), 1);
@@ -382,13 +383,7 @@ fn review_preview_includes_fresh_project_files_and_explicit_context() {
                 "--dry-run",
             ],
         ));
-        let evidence: Value = serde_json::from_str(
-            preview["request"]["messages"][1]["content"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        let context = &evidence["project_context"];
+        let context = &preview["investigations"][0]["project_context"];
         assert!(context.to_string().contains(instruction));
         assert!(context.to_string().contains("export function deck()"));
         assert!(!context.to_string().contains("private-value"));
@@ -399,19 +394,18 @@ fn review_preview_includes_fresh_project_files_and_explicit_context() {
     }
 }
 #[test]
-fn review_without_project_files_returns_no_generic_advice_or_service_request() {
+fn review_without_project_files_retains_findings_without_edits() {
     let temp = tempfile::tempdir().unwrap();
     let w = seed(temp.path());
     let mut session = w.session("s_test", None).unwrap();
     session.project_root = Some(temp.path().join("missing").to_string_lossy().into_owned());
     w.save_session(&session).unwrap();
-    // No review provider or credential is configured: a service call would fail.
     let result = report_data(invoke(temp.path(), &["report", "--session", "s_test"]));
     assert!(result["recommendations"].as_array().unwrap().is_empty());
-    assert!(result["message"]
-        .as_str()
-        .unwrap()
-        .contains("No LLM request sent"));
+    assert_eq!(result["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(result["cli_invocations"], 2);
+    let md = std::fs::read_to_string(result["report_path"].as_str().unwrap()).unwrap();
+    assert!(md.contains("Verification needs clearer evidence"));
 }
 #[test]
 fn purge_preserves_new_revision_and_its_analysis() {
@@ -487,23 +481,18 @@ fn recurring_review_bounds_corpus_sample_and_support_refs() {
         w.save_analysis(&analysis).unwrap();
     }
     let preview = data(invoke(temp.path(), &["report", "--dry-run"]));
-    let evidence: Value = serde_json::from_str(
-        preview["request"]["messages"][1]["content"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(evidence["sessions"].as_array().unwrap().len(), 3);
-    assert_eq!(evidence["omitted_supporting_sessions"], 28);
+    let evidence = preview["investigations"][0]["initial"].clone();
+    assert_eq!(evidence["sessions"].as_array().unwrap().len(), 4);
+    assert_eq!(evidence["omitted_supporting_sessions"], 27);
     assert_eq!(evidence["patterns"][0]["corpus_sessions"], 31);
-    assert_eq!(evidence["patterns"][0]["selected_sessions"], 3);
+    assert_eq!(evidence["patterns"][0]["selected_sessions"], 4);
     let report = report_data(invoke(temp.path(), &["report"]));
     assert_eq!(report["statistics"]["sessions"], 31);
     assert_eq!(report["statistics"]["turns"], 31);
-    assert_eq!(report["selection"]["sampled_sessions"], 3);
+    assert_eq!(report["selection"]["sampled_sessions"], 4);
     assert_eq!(report["sources"].as_array().unwrap().len(), 31);
     let markdown = std::fs::read_to_string(report["report_path"].as_str().unwrap()).unwrap();
-    assert!(markdown.contains("| 31 | 31 | 3 |"));
+    assert!(markdown.contains("| 31 | 31 | 4 |"));
     for r in evidence["patterns"][0]["supporting"].as_array().unwrap() {
         assert!(evidence["sessions"]
             .as_array()
@@ -529,15 +518,14 @@ fn combined_report_rejects_review_and_handles_filters_and_empty_corpus() {
         &["report", "--dry-run", "--opportunity", "none"],
     ));
     assert_eq!(preview["selection"]["eligible_patterns"], 0);
-    let prompt = preview["request"]["messages"][0]["content"]
+    assert!(preview["contract"]["prompt"]
         .as_str()
-        .unwrap();
-    assert!(prompt.contains("Humanizer: remove AI writing patterns"));
-    assert!(prompt.contains("Preserve the required JSON schema"));
+        .unwrap()
+        .contains("Investigate before drafting"));
     assert!(w.list_json::<Value>("reports").unwrap().is_empty());
     let empty = report_data(invoke(temp.path(), &["report", "--agent", "claude"]));
     assert_eq!(empty["statistics"]["sessions"], 0);
-    assert_eq!(empty["api_calls"], 0);
+    assert_eq!(empty["cli_invocations"], 0);
     assert!(empty["recommendations"].as_array().unwrap().is_empty());
     let markdown = std::fs::read_to_string(empty["report_path"].as_str().unwrap()).unwrap();
     assert!(markdown.contains("Model review was skipped"));
@@ -546,10 +534,11 @@ fn combined_report_rejects_review_and_handles_filters_and_empty_corpus() {
         let output = Command::new(env!("CARGO_BIN_EXE_jta"))
             .arg("--workspace")
             .arg(temp.path())
+            .env("PATH", fake_path(temp.path()))
             .args(["report", "--format", format])
             .output()
             .unwrap();
-        assert!(String::from_utf8_lossy(&output.stderr).contains("No"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Review"));
         let markdown = generated_markdown(output);
         assert!(markdown.starts_with("# Coding agent report"));
         assert!(markdown.contains("## Corpus statistics"));
@@ -558,261 +547,12 @@ fn combined_report_rejects_review_and_handles_filters_and_empty_corpus() {
     let mut session = w.session("s_test", None).unwrap();
     session.project_root = Some(temp.path().to_string_lossy().into_owned());
     w.save_session(&session).unwrap();
-    let unavailable = report_data(invoke(temp.path(), &["report", "--session", "s_test"]));
-    assert!(unavailable["message"]
-        .as_str()
-        .unwrap()
-        .contains("no review provider is configured"));
-    assert_eq!(unavailable["statistics"]["sessions"], 1);
-    assert_eq!(unavailable["api_calls"], 0);
+    let result = report_data(invoke(temp.path(), &["report", "--session", "s_test"]));
+    assert_eq!(result["statistics"]["sessions"], 1);
+    assert_eq!(result["cli_invocations"], 2);
+    assert_eq!(result["review_execution"]["backend"], "codex");
 }
-#[test]
-fn review_skips_insufficient_support_without_discarding_eligible_proposals() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
 
-    for case in [
-        "mixed",
-        "all_skipped",
-        "isolated",
-        "preliminary",
-        "empty",
-        "empty_unexplained",
-        "unknown_reference",
-        "generic",
-        "invented_target",
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        let w = seed(temp.path());
-        std::fs::write(
-            temp.path().join("AGENTS.md"),
-            "Run npm test before delivery.",
-        )
-        .unwrap();
-        let project_root = temp.path().canonicalize().unwrap();
-        let target_path = project_root.join("AGENTS.md");
-        let base = w.session("s_test", None).unwrap();
-        let base_analysis: Analysis = w.load_json("analyses", "a_test").unwrap();
-        for id in ["s_second", "s_third"] {
-            let mut s = base.clone();
-            s.id = id.into();
-            w.save_session(&s).unwrap();
-            let mut a = base_analysis.clone();
-            a.id = format!("a_{id}");
-            a.session_id = s.id;
-            if case == "preliminary" && id == "s_third" {
-                a.turns.get_mut(&1).unwrap().answers.insert(
-                    "remediation_surface".into(),
-                    dist(
-                        &["none", "orchestration_or_runtime"],
-                        "orchestration_or_runtime",
-                    ),
-                );
-            }
-            w.save_analysis(&a).unwrap();
-        }
-        let proposal = |ids: &[&str]| {
-            json!({
-                "title":"Verify changes", "observed_pattern":"Checks omitted",
-                "project_root":project_root,
-                "targets":[{"path":target_path,"action":"edit","before":"Run npm test before delivery.",
-                    "after":"Run npm test before delivery and report the outcome.","rationale":"Expose the existing project check result.",
-                    "context_refs":[{"path":target_path,"quote":"Run npm test"}]}],
-                "outcome_effect":"Completion unverified", "uncertainty":"Limited evidence",
-                "counterexamples":[], "remediation_surface":"AGENTS.md",
-                "proposed_change":"Run relevant checks", "scope":"Coding tasks",
-                "risk":"Additional latency", "evaluation_plan":"Measure verified outcomes",
-                "supporting_refs":ids.iter().map(|id|json!({"session_id":id,"turn_id":1})).collect::<Vec<_>>()
-            })
-        };
-        // Repeating a session reference must not count as distinct support.
-        let insufficient = proposal(&["s_test", "s_test", "s_test"]);
-        let eligible = proposal(&["s_test", "s_second", "s_third"]);
-        let proposals = match case {
-            "empty" | "empty_unexplained" => vec![],
-            "mixed" => vec![insufficient, eligible],
-            "all_skipped" | "isolated" | "preliminary" => vec![insufficient],
-            "generic" => {
-                let mut generic = eligible;
-                generic.as_object_mut().unwrap().remove("targets");
-                vec![generic]
-            }
-            "invented_target" => {
-                let mut invented = eligible;
-                invented["targets"][0]["path"] = json!("/invented/SKILL.md");
-                vec![invented]
-            }
-            _ => vec![eligible, proposal(&["s_test", "s_second", "s_unknown"])],
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut c = w.config().unwrap();
-        c.review.provider = "openai".into();
-        c.review.endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        c.review.api_key_env = "JTA_TEST_REVIEW_KEY".into();
-        std::fs::write(
-            w.data_dir().join("config.json"),
-            serde_json::to_vec(&c).unwrap(),
-        )
-        .unwrap();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let mut buf = [0; 4096];
-            let end = loop {
-                let n = stream.read(&mut buf).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-                if let Some(pos) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
-                    break pos + 4;
-                }
-            };
-            let length: usize = String::from_utf8_lossy(&bytes[..end])
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|v| v.trim().parse().unwrap())
-                })
-                .unwrap();
-            while bytes.len() < end + length {
-                let n = stream.read(&mut buf).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-            }
-            let request: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
-            let minimum = if matches!(case, "isolated" | "preliminary") {
-                1
-            } else {
-                3
-            };
-            if case == "preliminary" {
-                let evidence: Value =
-                    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
-                        .unwrap();
-                assert_eq!(evidence["preliminary"], true);
-                assert_eq!(evidence["sessions"].as_array().unwrap().len(), 3);
-                assert!(request["messages"][0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Do not claim established recurrence"));
-            }
-            assert!(request["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("at least {minimum} distinct session IDs")));
-            assert!(request["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("summary must give a concise, evidence-based explanation"));
-            let mut result = json!({
-                "summary":"The sampled turns do not establish three sessions supporting the same edit.",
-                "themes":["The existing instruction already requires npm test before delivery."],
-                "recommendations":proposals
-            });
-            if case == "empty_unexplained" {
-                result.as_object_mut().unwrap().remove("summary");
-                result.as_object_mut().unwrap().remove("themes");
-            }
-            let response = json!({"choices":[{"finish_reason":"stop","message":{"content":result.to_string()}}]}).to_string();
-            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
-        });
-        let mut command = Command::new(env!("CARGO_BIN_EXE_jta"));
-        command
-            .args([
-                "--workspace",
-                temp.path().to_str().unwrap(),
-                "report",
-                "--format",
-                "json",
-            ])
-            .env("JTA_TEST_REVIEW_KEY", "test-key");
-        if case == "isolated" {
-            command.args(["--session", "s_test"]);
-        }
-        let output = command.output().unwrap();
-        handle.join().unwrap();
-        if matches!(case, "unknown_reference" | "generic" | "invented_target") {
-            assert!(!output.status.success());
-            assert!(w.list_json::<Value>("recommendations").unwrap().is_empty());
-            continue;
-        }
-        let result = report_data(output);
-        assert_eq!(result["api_calls"], 1);
-        let report = std::fs::read_to_string(result["report_path"].as_str().unwrap()).unwrap();
-        assert!(report.contains("## Summary"));
-        let empty = matches!(case, "empty" | "empty_unexplained");
-        if case != "all_skipped" && !empty {
-            assert!(report.contains("## Recommendations"));
-        }
-        let expected_saved = usize::from(case != "all_skipped" && !empty);
-        assert_eq!(
-            result["recommendations"].as_array().unwrap().len(),
-            expected_saved
-        );
-        assert_eq!(
-            w.list_json::<Value>("recommendations").unwrap().len(),
-            expected_saved
-        );
-        if empty {
-            assert!(result["skipped_recommendations"]
-                .as_array()
-                .unwrap()
-                .is_empty());
-            assert!(!report.contains("## Recommendations"));
-            if case == "empty" {
-                assert!(report.contains("Model explanation: The sampled turns"));
-                assert!(report.contains("### Model observations"));
-                assert!(report.contains(result["summary"].as_str().unwrap()));
-                assert!(report.contains(result["themes"][0].as_str().unwrap()));
-                assert!(
-                    report.find("Model explanation:").unwrap()
-                        < report.find("## Corpus statistics").unwrap()
-                );
-                assert!(!report.contains("did not provide an explanation"));
-            } else {
-                assert!(report.contains("The model did not provide an explanation"));
-            }
-        } else if matches!(case, "isolated" | "preliminary") {
-            assert_eq!(result["recommendations"][0]["isolated"], case == "isolated");
-            assert_eq!(
-                result["recommendations"][0]["preliminary"],
-                case == "preliminary"
-            );
-            if case == "preliminary" {
-                assert!(report.contains("Preliminary review"));
-                assert!(report.contains("Preliminary suggestion supported by 1 session(s)"));
-                assert_eq!(result["selection"]["sampled_sessions"], 3);
-            }
-            assert!(result["skipped_recommendations"]
-                .as_array()
-                .unwrap()
-                .is_empty());
-        } else {
-            assert!(result["summary"].is_null());
-            assert!(result["themes"].is_null());
-            assert!(!report.contains("The sampled turns do not establish"));
-            assert!(!report.contains("The existing instruction already requires"));
-            assert_eq!(
-                result["skipped_recommendations"][0]["supporting_sessions"],
-                1
-            );
-            assert_eq!(result["skipped_recommendations"][0]["required_sessions"], 3);
-            assert_eq!(result["warnings"].as_array().unwrap().len(), 1);
-        }
-        if case == "all_skipped" {
-            assert!(result["message"]
-                .as_str()
-                .unwrap()
-                .contains("No recommendations met"));
-        }
-    }
-}
 #[test]
 fn comparison_uses_proportions_and_handles_empty_denominators() {
     let temp = tempfile::tempdir().unwrap();
@@ -1092,6 +832,7 @@ fn human_report_shows_per_agent_outcomes_and_token_coverage() {
     let output = Command::new(env!("CARGO_BIN_EXE_jta"))
         .arg("--workspace")
         .arg(temp.path())
+        .env("PATH", fake_path(temp.path()))
         .arg("report")
         .output()
         .unwrap();
@@ -1103,7 +844,7 @@ fn human_report_shows_per_agent_outcomes_and_token_coverage() {
         temp.path(),
         &["report", "--agent", "claude_code", "--dry-run"],
     ));
-    assert!(review["request"].is_object());
+    assert!(review["contract"].is_object());
 }
 #[test]
 fn non_git_discovery_scope_changes_preserve_immutable_revision_history() {
@@ -1161,7 +902,7 @@ fn non_git_discovery_scope_changes_preserve_immutable_revision_history() {
 }
 
 #[test]
-fn init_updates_only_supplied_settings_and_switches_provider_defaults() {
+fn init_updates_only_supplied_settings_and_switches_cli_defaults() {
     let temp = tempfile::tempdir().unwrap();
     data(invoke(
         temp.path(),
@@ -1171,23 +912,22 @@ fn init_updates_only_supplied_settings_and_switches_provider_defaults() {
             "42",
             "--jev-model",
             "custom-model",
-            "--review-provider",
-            "openrouter",
+            "--review-backend",
+            "claude",
         ],
     ));
     data(invoke(
         temp.path(),
-        &["init", "--review-provider", "openai", "--no-input"],
+        &["init", "--review-backend", "codex", "--no-input"],
     ));
     let w = Workspace::discover(Some(temp.path())).unwrap();
     let c = w.config().unwrap();
     assert_eq!(c.retention_days, 42);
     assert_eq!(c.jev.model, "custom-model");
-    assert_eq!(c.review.provider, "openai");
-    assert_eq!(c.review.api_key_env, "OPENAI_API_KEY");
-    assert_eq!(c.review.endpoint, Config::default().review.endpoint);
+    assert_eq!(c.review.backend, "codex");
+    assert!(c.review.model.is_none());
     data(invoke(temp.path(), &["init", "--no-input"]));
-    assert_eq!(w.config().unwrap().review.provider, "openai");
+    assert_eq!(w.config().unwrap().review.backend, "codex");
 }
 
 #[test]
@@ -1241,6 +981,7 @@ fn review_explains_default_limit_and_all_expands_selection() {
     let output = Command::new(env!("CARGO_BIN_EXE_jta"))
         .arg("--workspace")
         .arg(temp.path())
+        .env("PATH", fake_path(temp.path()))
         .args(["report", "--dry-run"])
         .output()
         .unwrap();
@@ -1330,6 +1071,7 @@ fn readable_numbers_and_durations_preserve_exact_json() {
     let output = Command::new(env!("CARGO_BIN_EXE_jta"))
         .arg("--workspace")
         .arg(temp.path())
+        .env("PATH", fake_path(temp.path()))
         .arg("report")
         .output()
         .unwrap();
@@ -1341,47 +1083,21 @@ fn readable_numbers_and_durations_preserve_exact_json() {
 }
 
 #[test]
-fn global_credentials_work_across_projects_with_env_and_dotenv_overrides() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+fn global_jev_credentials_work_across_projects_with_env_and_dotenv_overrides() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("user-data");
     std::fs::create_dir(&home).unwrap();
-    let key_name = "JTA_TEST_SHARED_REVIEW_KEY";
+    let key_name = "JTA_TEST_SHARED_JEV_KEY";
     std::fs::write(
         home.join("credentials.json"),
         json!({key_name:"global-test-secret"}).to_string(),
     )
     .unwrap();
-    for (i, expected) in [
-        "global-test-secret",
-        "project-test-secret",
-        "shell-test-secret",
-    ]
-    .iter()
-    .enumerate()
-    {
+    for i in 0..3 {
         let project = temp.path().join(format!("project{i}"));
         let w = seed(&project);
-        std::fs::write(
-            project.join("README.md"),
-            "Run cargo test before shipping changes.",
-        )
-        .unwrap();
-        let mut session = w.session("s_test", None).unwrap();
-        session.project_root = Some(
-            project
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-        );
-        w.save_session(&session).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut c = w.config().unwrap();
-        c.review.provider = "openai".into();
-        c.review.api_key_env = key_name.into();
-        c.review.endpoint = format!("http://{}/review", listener.local_addr().unwrap());
+        c.jev.api_key_env = key_name.into();
         w.save_config(&c).unwrap();
         if i > 0 {
             std::fs::write(
@@ -1390,53 +1106,17 @@ fn global_credentials_work_across_projects_with_env_and_dotenv_overrides() {
             )
             .unwrap();
         }
-        let handle = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let header_end = loop {
-                let mut buf = [0; 4096];
-                let n = socket.read(&mut buf).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break end + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
-            let length: usize = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|v| v.trim().parse().unwrap())
-                })
-                .unwrap();
-            while bytes.len() < header_end + length {
-                let mut buf = [0; 4096];
-                let n = socket.read(&mut buf).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-            }
-            let response = json!({"choices":[{"finish_reason":"stop","message":{"content":json!({"summary":"No changes needed.","themes":[],"recommendations":[]}).to_string()}}]}).to_string();
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
-            headers
-        });
         let mut command = Command::new(env!("CARGO_BIN_EXE_jta"));
         command
             .arg("--workspace")
             .arg(&project)
-            .args(["report", "--session", "s_test", "--format", "json"])
+            .args(["init", "--no-input", "--format", "json"])
             .env("JTA_HOME", &home)
             .env_remove(key_name);
         if i == 2 {
-            command.env(key_name, expected);
+            command.env(key_name, "shell-test-secret");
         }
         let output = command.output().unwrap();
-        let headers = handle.join().unwrap();
-        assert!(headers.contains(&format!("Bearer {expected}")));
         for secret in [
             "global-test-secret",
             "project-test-secret",
@@ -1444,19 +1124,314 @@ fn global_credentials_work_across_projects_with_env_and_dotenv_overrides() {
         ] {
             assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
             assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
-            assert!(!std::fs::read_to_string(w.data_dir().join("config.json"))
-                .unwrap()
-                .contains(secret));
         }
-        assert_eq!(report_data(output)["api_calls"], 1);
-        let status = Command::new(env!("CARGO_BIN_EXE_jta"))
-            .arg("--workspace")
-            .arg(&project)
-            .args(["init", "--no-input", "--format", "json"])
-            .env("JTA_HOME", &home)
-            .env_remove(key_name)
-            .output()
-            .unwrap();
-        assert_eq!(data(status)["review_key_ready"], true);
+        let result = data(output);
+        assert_eq!(result["jev_key_ready"], true);
+        assert!(result.get("review_key_ready").is_none());
+        assert!(result["configuration"]["review"]
+            .get("api_key_env")
+            .is_none());
     }
+}
+
+fn report_with_mode(root: &std::path::Path, mode: &str, extra: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_jta"))
+        .arg("--workspace")
+        .arg(root)
+        .args(["report", "--format", "json"])
+        .args(extra)
+        .env("PATH", fake_path(root))
+        .env("JTA_FAKE_MODE", mode)
+        .env("JEV_API_KEY", "should-not-reach-report-cli")
+        .env("JTA_FAKE_LOG", root.join("cli-calls.log"))
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cli_backends_retrieve_validate_cache_and_refresh_without_review_keys() {
+    for backend in ["codex", "claude"] {
+        let temp = tempfile::tempdir().unwrap();
+        let w = seed(temp.path());
+        std::fs::write(
+            temp.path().join("README.md"),
+            "Run cargo test.\npassword=secret-sentinel",
+        )
+        .unwrap();
+        let mut c = w.config().unwrap();
+        c.review.backend = backend.into();
+        c.review.model = Some("fixture-model".into());
+        w.save_config(&c).unwrap();
+        let base = w.session("s_test", None).unwrap();
+        let analysis: Analysis = w.load_json("analyses", "a_test").unwrap();
+        for i in 0..6 {
+            let mut s = base.clone();
+            s.id = format!("s_extra{i}");
+            s.events.push(jta::model::Event {
+                text: "password=secret-sentinel".into(),
+                ..Default::default()
+            });
+            w.save_session(&s).unwrap();
+            let mut a = analysis.clone();
+            a.id = format!("a_extra{i}");
+            a.session_id = s.id;
+            w.save_analysis(&a).unwrap();
+        }
+        let result = report_data(report_with_mode(temp.path(), "", &[]));
+        assert_eq!(result["cli_invocations"], 2);
+        assert_eq!(result["review_execution"]["backend"], backend);
+        assert_eq!(result["statistics"]["sessions"], 7);
+        assert_eq!(result["selection"]["sampled_sessions"], 4);
+        assert_eq!(result["selection"]["available_sessions"], 7);
+        assert_eq!(result["recommendations"][0]["supporting_sessions"], 7);
+        assert_eq!(result["inspected_refs"].as_array().unwrap().len(), 7);
+        assert!(!result.to_string().contains("secret-sentinel"));
+        let calls = std::fs::read_to_string(temp.path().join("cli-calls.log")).unwrap();
+        assert_eq!(calls.lines().count(), 2);
+        for line in calls.lines() {
+            let call: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(call["sessions"], 7);
+            assert!(
+                !std::path::Path::new(call["cwd"].as_str().unwrap()).exists(),
+                "temporary evidence must be removed"
+            );
+            assert!(call["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "fixture-model"));
+        }
+        let cached = report_data(report_with_mode(temp.path(), "", &[]));
+        assert_eq!(cached["cli_invocations"], 0);
+        assert_eq!(cached["review_performed"], true);
+        let md = std::fs::read_to_string(cached["report_path"].as_str().unwrap()).unwrap();
+        assert!(!md.contains("Model review was skipped"));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cli-calls.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        let refreshed = report_data(report_with_mode(temp.path(), "", &["--refresh"]));
+        assert_eq!(refreshed["cli_invocations"], 2);
+        std::fs::write(temp.path().join("README.md"), "Run cargo test --locked.").unwrap();
+        let changed = report_data(report_with_mode(temp.path(), "", &[]));
+        assert_eq!(changed["cli_invocations"], 2);
+        // Suggested changes were never applied.
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("README.md")).unwrap(),
+            "Run cargo test --locked."
+        );
+    }
+}
+
+#[test]
+fn cli_validation_correction_is_bounded_and_bad_results_never_become_reports() {
+    for backend in ["codex", "claude"] {
+        for mode in [
+            "repair",
+            "bad_quote",
+            "unknown_ref",
+            "uninspected",
+            "fail",
+            "malformed",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let w = seed(temp.path());
+            std::fs::write(temp.path().join("README.md"), "Run cargo test.").unwrap();
+            let mut c = w.config().unwrap();
+            c.review.backend = backend.into();
+            w.save_config(&c).unwrap();
+            let output = report_with_mode(temp.path(), mode, &[]);
+            if mode == "repair" {
+                let result = report_data(output);
+                assert_eq!(result["cli_invocations"], 4);
+                assert_eq!(result["recommendations"].as_array().unwrap().len(), 1);
+            } else {
+                assert!(
+                    !output.status.success(),
+                    "{backend} {mode} unexpectedly succeeded"
+                );
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("secret-sentinel"));
+                assert!(w.list_json::<Value>("reports").unwrap().is_empty());
+                assert!(w.list_json::<Value>("recommendations").unwrap().is_empty());
+                if let Ok(log) = std::fs::read_to_string(temp.path().join("cli-calls.log")) {
+                    assert!(log.lines().count() <= 2);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn report_splits_projects_before_recurrence_and_enforces_investigation_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let w = seed(temp.path());
+    let base = w.session("s_test", None).unwrap();
+    let analysis: Analysis = w.load_json("analyses", "a_test").unwrap();
+    for i in 0..3 {
+        let root = temp.path().join(format!("project{i}"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("README.md"), "Run the project check.").unwrap();
+        let mut s = base.clone();
+        s.id = if i == 0 {
+            "s_test".into()
+        } else {
+            format!("s_project{i}")
+        };
+        s.project_root = Some(root.canonicalize().unwrap().to_string_lossy().into_owned());
+        w.save_session(&s).unwrap();
+        let mut a = analysis.clone();
+        a.id = if i == 0 {
+            "a_test".into()
+        } else {
+            format!("a_project{i}")
+        };
+        a.session_id = s.id;
+        w.save_analysis(&a).unwrap();
+    }
+    let strict = data(invoke(
+        temp.path(),
+        &["report", "--recurring-only", "--dry-run"],
+    ));
+    assert_eq!(strict["selection"]["selected_patterns"], 0);
+    let preview = data(invoke(temp.path(), &["report", "--all", "--dry-run"]));
+    assert_eq!(preview["investigations"].as_array().unwrap().len(), 3);
+    assert_eq!(preview["selection"]["preliminary"], true);
+    for job in preview["investigations"].as_array().unwrap() {
+        assert_eq!(job["available_sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            job["project_context"]["projects"].as_array().unwrap().len(),
+            1
+        );
+    }
+    let mut c = w.config().unwrap();
+    c.review.max_investigations = 2;
+    w.save_config(&c).unwrap();
+    let result = report_data(report_with_mode(temp.path(), "", &["--all"]));
+    assert_eq!(result["cli_invocations"], 3);
+    assert_eq!(result["selection"]["omitted_patterns"], 1);
+    assert_eq!(
+        result["review_execution"]["stages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn insufficient_distinct_session_support_is_rejected_after_correction() {
+    let temp = tempfile::tempdir().unwrap();
+    let w = seed(temp.path());
+    std::fs::write(temp.path().join("README.md"), "Run cargo test.").unwrap();
+    let base = w.session("s_test", None).unwrap();
+    let analysis: Analysis = w.load_json("analyses", "a_test").unwrap();
+    for i in 0..2 {
+        let mut s = base.clone();
+        s.id = format!("s_{i}");
+        w.save_session(&s).unwrap();
+        let mut a = analysis.clone();
+        a.id = format!("a_{i}");
+        a.session_id = s.id;
+        w.save_analysis(&a).unwrap();
+    }
+    let output = report_with_mode(temp.path(), "insufficient", &[]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("insufficient distinct-session support")
+    );
+    assert!(w.list_json::<Value>("reports").unwrap().is_empty());
+}
+
+#[test]
+fn legacy_review_settings_migrate_without_resolving_retired_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let w = seed(temp.path());
+    let mut config = serde_json::to_value(w.config().unwrap()).unwrap();
+    config["review"] = json!({"provider":"openrouter","model":"old/api-model", "endpoint":"https://example.invalid", "api_key_env":"OLD_KEY"});
+    std::fs::write(w.data_dir().join("config.json"), config.to_string()).unwrap();
+    let setup = data(invoke(temp.path(), &["init", "--no-input"]));
+    assert_eq!(setup["configuration"]["review"]["backend"], "codex");
+    assert!(setup["configuration"]["review"]["model"].is_null());
+    for removed in ["provider", "endpoint", "api_key_env"] {
+        assert!(setup["configuration"]["review"].get(removed).is_none());
+    }
+    for removed in [
+        "--review-provider",
+        "--review-endpoint",
+        "--review-api-key-env",
+    ] {
+        assert_eq!(
+            invoke(temp.path(), &["init", removed, "value"])
+                .status
+                .code(),
+            Some(2)
+        );
+    }
+}
+
+#[test]
+fn dry_run_requires_no_cli_and_reports_missing_runtime_and_invalid_budgets() {
+    let temp = tempfile::tempdir().unwrap();
+    seed(temp.path());
+    for (arg, value) in [
+        ("--review-timeout-secs", "0"),
+        ("--review-max-investigations", "0"),
+        ("--review-backend", "openai"),
+    ] {
+        assert_eq!(
+            invoke(temp.path(), &["init", "--no-input", arg, value])
+                .status
+                .code(),
+            Some(2)
+        );
+    }
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jta"))
+            .arg("--workspace")
+            .arg(temp.path())
+            .args(args)
+            .env("PATH", "")
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["report", "--dry-run", "--format", "json"])
+        .status
+        .success());
+    let failure = run(&["report"]);
+    assert!(!failure.status.success());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("Cannot start report CLI"));
+    let preview = data(invoke(temp.path(), &["report", "--dry-run"]));
+    let id = preview["investigations"][0]["id"].as_str().unwrap();
+    let shown = data(invoke(temp.path(), &["show", id]));
+    assert_eq!(
+        shown["project_root"],
+        temp.path().canonicalize().unwrap().to_str().unwrap()
+    );
+}
+
+#[test]
+fn cached_results_are_revalidated_and_purged_with_source_revisions() {
+    let temp = tempfile::tempdir().unwrap();
+    let w = seed(temp.path());
+    report_data(report_with_mode(temp.path(), "", &[]));
+    let cached = w.list_json::<Value>("review_cache").unwrap();
+    assert_eq!(cached.len(), 2);
+    let mut paths = std::fs::read_dir(w.data_dir().join("review_cache"))
+        .unwrap()
+        .map(|p| p.unwrap().path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    // Corrupt both cached inspection records; neither can bypass current validation.
+    for path in &paths {
+        let mut result: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        result["response"]["inspected_refs"] = json!([{"session_id":"unknown","turn_id":99}]);
+        std::fs::write(path, result.to_string()).unwrap();
+    }
+    assert!(!report_with_mode(temp.path(), "", &[]).status.success());
+    assert_eq!(w.list_json::<Value>("reports").unwrap().len(), 1);
+    data(invoke(temp.path(), &["purge", "--older-than", "30d"]));
+    assert!(w.list_json::<Value>("review_cache").unwrap().is_empty());
 }

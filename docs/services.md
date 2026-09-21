@@ -44,57 +44,72 @@ An omitted check does not establish that no check happened. Mechanical dependenc
 are candidates for Jev, not preassigned usefulness. Cross-question contradictions
 and close probability margins are marked for further review.
 
-`prepare_analysis` and `prepare_review` return exact request bodies without reading
-credentials or making network requests. Review uses Chat Completions with strict
-JSON Schema for [OpenAI](https://developers.openai.com/api/docs/guides/structured-outputs)
-and [OpenRouter](https://openrouter.ai/docs/guides/features/structured-outputs).
-OpenRouter requests require supporting provider parameters. Review responses
-include a plain-language `summary`, a `themes` array, and
-`recommendations`. Summary and themes are displayed only when all proposals pass
-the applicable support threshold, including when the model returns no proposals.
-Empty reviews preserve the model's explanation and observations in both JSON and
-Markdown. The prompt asks for the specific constraints that prevented an edit
-and what additional evidence or context would help. When local filtering rejects
-proposals, their accompanying prose is suppressed so rejected suggestions do not
-leak into the report; local rejection reasons remain visible.
-When no pattern meets the configured recurrence threshold, the default report
-runs a preliminary review requiring at least one supporting session per proposal.
-The prompt, report, and saved recommendations identify this limited support;
-`--recurring-only` retains the strict recurrence requirement.
-Review proposals must include observed pattern, outcome effect, supporting session/turn pairs,
-uncertainty, counterexamples, remediation surface, concrete change, scope, risk,
-and an evaluation plan. Local validation rejects malformed or unknown references.
-No generated review output is executed or used as a replacement for Jev scoring.
+`prepare_analysis` returns exact Jev request bodies without reading credentials
+or making network calls. Jev HTTP uses configurable request timeouts, a maximum
+20-second connection timeout, no redirects, and up to three attempts for connection
+failures, timeouts, HTTP 429, or server errors. Retry-After is capped at 30 seconds;
+otherwise delays are one then two seconds. Responses are limited to 8 MiB.
+Authentication failures are not retried. Errors omit bodies and credentials.
+HTTPS is required except for loopback test servers.
 
-`jta report` combines these proposals with full-corpus
-statistics in a Markdown file. Successful generation prints only the file path;
-JSON mode returns `report_path` and `data_path`, with the full data stored in the
-JSON companion. Explicit dry runs still expose the request for inspection.
-Report generation suppresses request progress and correction notices; failures
-remain errors. With no configured provider, statistics are saved with an
-explanation that recommendations are unavailable.
+## Report CLI contracts
 
-The system prompt embeds the pinned MIT-licensed
-[Humanizer skill](../third_party/humanizer/SOURCE.md) in embedded mode. It edits
-prose within the structured response, preserving the schema, literal file edits,
-quoted context, counts, and citations. This adds prompt context but no separate
-rewriting request. Grounding validation still applies to the final response.
+Report generation uses `codex` or `claude` on PATH. JTA has no OpenAI/OpenRouter
+review client or review credentials. `--version` checks availability and becomes
+part of cache identity; authentication is exercised by the actual investigation.
+No login command is launched and no CLI token is copied into JTA storage.
 
-HTTP uses configurable total request timeouts, a maximum twenty-second connection
-timeout, no redirects, and at most three attempts for connection failures,
-timeouts, HTTP 429, or server errors. Retry-After seconds are capped at thirty;
-otherwise delays are one then two seconds. Authentication and validation failures
-are not retried. Response bodies are limited to 8 MiB. Errors omit remote bodies,
-credential values, and endpoint details. HTTPS is required except for loopback
-mock servers. Retrying a timed-out POST may cause a provider to bill both attempts.
+- Codex: `exec --sandbox read-only --ignore-user-config --ignore-rules
+  --skip-git-repo-check --ephemeral --json --output-schema schema.json
+  --output-last-message answer.json -`. Instructions arrive on stdin. A successful
+  `turn.completed` event and a valid JSON answer file are both required.
+- Claude: `--print --safe-mode --no-session-persistence --output-format stream-json
+  --verbose --permission-mode dontAsk --tools Read,Glob,Grep
+  --allowedTools Read,Glob,Grep --strict-mcp-config --mcp-config '{"mcpServers":{}}'
+  --json-schema <schema>`. A successful `result` event with `structured_output` is
+  required. Safe mode preserves CLI authentication; bare mode is intentionally
+  not used because it excludes subscription login.
 
-Offline contract tests use local HTTP fixtures and never require paid credentials.
+These interfaces were checked against the installed CLIs and their official docs:
+[Codex noninteractive mode](https://learn.chatgpt.com/docs/non-interactive-mode),
+[Claude programmatic usage](https://code.claude.com/docs/en/headless), and
+[Claude CLI reference](https://code.claude.com/docs/en/cli-reference).
+Use current CLI versions supporting the flags above. JTA isolates report tasks
+from user/project customizations; an optional `review.model` is passed explicitly.
 
-Every successful response must identify the actual Jev model. Analysis provenance
-stores both requested alias and resolved models, and reports flag mixed resolved
-versions even when local configuration fingerprints match. An unchanged alias can
-resolve differently later; cached analyses cannot discover that change without a
-new request. Pin a provider model version for controlled comparisons or refresh
-analyses and inspect the resolved identities. Source and bounded-evidence warnings
-are exposed in report `evidence_warnings`; original distributions are never
-rewritten into synthetic certainty or synthetic uncertainty.
+Processes start directly, with no shell interpolation, in temporary evidence
+folders. Original project paths identify citations; agents are instructed to read
+only staged files. Codex enforces read-only tool execution, while Claude receives
+only Read/Glob/Grep tools. This is not a claim that staged files form a complete
+filesystem read sandbox. Transcript instructions remain untrusted data.
+Ephemeral sessions avoid adding JTA investigations to normal session discovery.
+On Unix, process groups are killed on timeout, cancellation, and exit so tool
+subprocesses do not survive their investigation. Raw CLI errors are not echoed.
+
+`manifest.json` maps normalized sessions and original project paths to redacted
+snapshot files. `initial.json` contains category samples or, for synthesis,
+validated investigation results. Session snapshots include the full normalized
+session and stored Jev judgments, allowing retrieval beyond the initial excerpts.
+Project files have separate count/size limits documented in the guide.
+
+The common response contains `summary`, `themes`, `findings`, `recommendations`,
+`inspected_refs`, and `inspected_files`. Findings require project-scoped source
+references but need not suggest an edit. Recommendations also require exact
+file targets, unique before passages, literal replacements, exact context quotes,
+and the configured number of distinct supporting sessions. Quotes and references
+must appear in the inspection record. Overlapping edits are rejected. Inspection
+is self-reported and cannot prove that the model actually read a particular file.
+
+One correction invocation is allowed after local validation failure. It receives
+the same staged evidence, the rejected answer, and the validation error. Malformed
+CLI events, failed execution, timeouts, and incomplete output fail immediately.
+No invalid report or recommendations are saved. Successful earlier stages can be
+reused on a later run.
+
+CLI event traces and reported usage are redacted before saving in `review_cache/`.
+Reports record invocation counts, elapsed time, per-stage usage, cache status, and
+coverage. CLI invocations are not equivalent to model requests. JTA does not apply
+a hard model-token or dollar limit; its budgets bound investigations, wall time,
+and captured process output. Cached stages report zero new invocations and keep
+historical usage separate. Purging expired source revisions also removes dependent
+cache entries and reports.

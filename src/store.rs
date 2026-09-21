@@ -105,9 +105,17 @@ impl Workspace {
         Ok(path)
     }
     pub fn config(&self) -> Result<Config> {
-        Ok(serde_json::from_slice(&fs::read(
-            self.data_dir().join("config.json"),
-        )?)?)
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(self.data_dir().join("config.json"))?)?;
+        // Retired HTTP review settings (including their model names) do not
+        // configure a CLI. Never resolve their credentials during migration.
+        if value["review"].get("provider").is_some()
+            || value["review"].get("endpoint").is_some()
+            || value["review"].get("api_key_env").is_some()
+        {
+            value["review"] = serde_json::to_value(crate::config::ReviewConfig::default())?;
+        }
+        Ok(serde_json::from_value(value)?)
     }
     pub fn save_session(&self, session: &Session) -> Result<()> {
         safe(&session.id)?;

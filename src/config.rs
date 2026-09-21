@@ -23,11 +23,12 @@ pub struct JevConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewConfig {
-    pub provider: String,
-    pub endpoint: String,
-    pub api_key_env: String,
-    pub model: String,
+    pub backend: String,
+    pub model: Option<String>,
+    /// Wall-clock limit for each CLI invocation, including tool use.
     pub timeout_secs: u64,
+    /// Hard cap on project/category investigations in a report.
+    pub max_investigations: usize,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -62,11 +63,10 @@ impl Default for JevConfig {
 impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
-            provider: "none".into(),
-            endpoint: "https://api.openai.com/v1/chat/completions".into(),
-            api_key_env: "OPENAI_API_KEY".into(),
-            model: "gpt-5.6-terra".into(),
-            timeout_secs: 120,
+            backend: "codex".into(),
+            model: None,
+            timeout_secs: 600,
+            max_investigations: 20,
         }
     }
 }

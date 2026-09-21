@@ -115,15 +115,15 @@ pub fn prompt(name: &str, label: &str) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn saves_keys_atomically_preserving_other_providers() {
+    fn saves_keys_atomically_preserving_other_key_names() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("jta/credentials.json");
         save(&path, "JEV_API_KEY", "test-jev").unwrap();
-        save(&path, "OPENAI_API_KEY", "test-openai").unwrap();
+        save(&path, "CUSTOM_JEV_KEY", "test-custom").unwrap();
         save(&path, "JEV_API_KEY", "test-replacement").unwrap();
         let keys = read(&path).unwrap();
         assert_eq!(keys["JEV_API_KEY"], "test-replacement");
-        assert_eq!(keys["OPENAI_API_KEY"], "test-openai");
+        assert_eq!(keys["CUSTOM_JEV_KEY"], "test-custom");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

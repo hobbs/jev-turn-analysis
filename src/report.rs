@@ -81,8 +81,8 @@ pub fn markdown(data: &Value) -> String {
     let (summary, recommendations) = review.split_once("## Themes\n").unwrap_or((review, ""));
     out.push_str(summary);
     out.push_str("## Corpus statistics\n\n");
-    let _ = writeln!(out, "| Analyzed sessions | Included turns | Sessions sampled for recommendations |\n| ---: | ---: | ---: |\n| {} | {} | {} |\n", count(sessions), count(turns), count(data["selection"]["sampled_sessions"].as_u64().unwrap_or(0)));
-    out.push_str("Statistics cover all analyzed sessions selected by the filters. Recommendations use excerpts from the smaller sample shown above. Missing measurements are shown as unknown.\n\n");
+    let _ = writeln!(out, "| Analyzed sessions | Included turns | Initially sampled sessions |\n| ---: | ---: | ---: |\n| {} | {} | {} |\n", count(sessions), count(turns), count(data["selection"]["sampled_sessions"].as_u64().unwrap_or(0)));
+    out.push_str("Statistics cover all analyzed sessions selected by the filters. Investigations start with the sample shown above and can retrieve more staged evidence; reported inspection appears separately. Missing measurements are shown as unknown.\n\n");
     let _ = writeln!(out, "{} current sessions in the workspace have no matching analysis and are excluded from these statistics. This workspace-wide count is independent of report filters.\n", display_value(&stats["unscored_current_sessions"]));
     if let Some(filters) = data["filters"].as_object() {
         let active: Vec<_> = filters

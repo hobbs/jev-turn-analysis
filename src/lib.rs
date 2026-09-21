@@ -6,6 +6,7 @@ pub mod model;
 pub mod redact;
 pub mod report;
 pub mod review_context;
+pub mod review_pipeline;
 pub mod services;
 pub mod store;
 

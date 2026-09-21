@@ -2,6 +2,32 @@
 
 Validated on 2026-09-20 with Rust 1.98.1 on macOS arm64.
 
+## CLI report redesign
+
+The report backend is now the installed Codex or Claude CLI. JTA manages only Jev
+authentication; the old OpenAI/OpenRouter HTTP review integrations are removed.
+The live HTTP review smoke tests below describe the retired implementation and
+are not evidence of live CLI compatibility.
+
+Current checks passed: **82 tests** (49 unit and 33 CLI integration tests),
+`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and
+`git diff --check`. The offline `llm_usage` example and updated command help also
+ran successfully.
+
+Automated CLI tests use temporary fake executables and synthetic sessions. They
+cover both output envelopes, read-only arguments, retrieval beyond the initial
+sample, project-scoped recurrence, synthesis, bounded validation correction,
+unknown/uninspected references, insufficient support, overlapping edits, independent
+caches, refresh, project-file invalidation, cache revalidation and purge, missing
+executables, malformed output, timeouts, redaction, and old configuration migration.
+They also verify that Jev credentials are excluded from the report CLI environment.
+Python 3 is required for these test fixtures.
+
+Installed CLI help and official documentation were checked for the adapter flags.
+No paid live agent investigations or model-quality benchmark was run for this
+redesign. CLI invocation counts are not model-call counts, inspection coverage is
+self-reported, and wall-clock budgets do not impose token/dollar limits.
+
 ## Public data only
 
 No personal Claude Code or Codex session directories were inspected or analyzed.
@@ -57,7 +83,7 @@ cargo test
 python3 scripts/download_examples.py --verify-only
 ```
 
-## Bounded live API smoke tests
+## Historical bounded live API smoke tests
 
 Credentials came from the existing `.env`; they were not printed or stored in
 analysis configuration or results. Live tests used only the public one-turn

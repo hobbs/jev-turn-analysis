@@ -31,11 +31,7 @@ pub async fn post(client: &Client, endpoint: &str, key: &str, payload: &Value) -
     );
     for attempt in 0..3u64 {
         let call = crate::ui::request_started();
-        let service = if payload.get("questions").is_some() {
-            "Jev"
-        } else {
-            "Review provider"
-        };
+        let service = "Jev";
         let activity = crate::ui::Activity::new(format!(
             "{service} API call {call} · attempt {} of 3",
             attempt + 1

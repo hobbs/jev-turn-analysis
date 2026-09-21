@@ -22,8 +22,8 @@ jta init
 jta analyze
 ```
 
-**`jta init` gets you ready.** It walks you through API keys and an optional review
-provider. Key entry is hidden, and saved keys work across all your projects.
+**`jta init` gets you ready.** It walks you through the Jev API key and a report CLI
+(`codex` or `claude`). Key entry is hidden, and saved keys work across all your projects.
 
 **`jta analyze` does the work.** It finds your project's sessions, scores them
 with Jev, and shows what succeeded, what was verified, and where to investigate.
@@ -42,83 +42,84 @@ skills, and tools:
 jta report
 ```
 
-Choose OpenAI or OpenRouter during `jta init` to enable review. If you skipped
-that choice, rerun `jta init` when you're ready.
-
-`jta report` saves one **Markdown report** with outcome tables, recurring patterns,
-token and timing coverage, agent/project breakdowns, and recommendations with
-proposed wording, tradeoffs, and ways to check the change. It prints only the
-path of the generated file to stdout. Status messages on stderr explain preliminary
-reviews or why recommendations were unavailable.
-Suggested edits are never applied automatically.
-
-Statistics cover the full filtered corpus; recommendations use a smaller sample.
-If no provider is configured or no project-specific edits are supported,
-the report still includes the statistics and explains what is missing. When the
-model returns no suggestions, its explanation and observations are saved in the
-report instead of being replaced by a generic status message. Provider
-errors fail the command rather than claiming that recommendations were generated.
-Recommendation prose uses the bundled [Humanizer skill](third_party/humanizer/SOURCE.md).
-
-By default, review selects **five priority patterns**, each supported by at least
-three sessions. If none meet that threshold, it reviews the available patterns
-and labels suggestions as **preliminary**, with limited session support. Use
-`--recurring-only` to skip this fallback. The report states how many patterns were
-selected and how many are available.
-The limit restricts the sample; it is not a token budget or a limit of five API
-calls or five recommendations.
+Choose a report CLI during `jta init`, or set it explicitly:
 
 ```sh
-jta report --top 10                        # Expand the pattern selection
-jta report --all                           # Include every eligible pattern
-jta report --session <session-id>          # Investigate a single session
-jta report --recurring-only               # Require recurring patterns
-jta report --dry-run                       # Preview without calling the provider
+jta init --review-backend codex            # Default
+jta init --review-backend claude
 ```
 
-`--all` still samples sessions and bounds excerpts. These patterns are broad rubric
-categories, not semantic issue clusters. See the [review assessment](docs/review-assessment.md)
-for prioritization, LLM token usage, and a 300,000-turn scaling check. Review needs readable project
-files to propose a concrete edit. If it cannot support a suggestion, the report
-explains that instead of filling space with generic advice.
+Install and authenticate the selected CLI separately. **JTA manages only the Jev
+API key.** Report generation uses the CLI's own authentication, with no review
+API key or HTTP endpoint in JTA configuration.
 
-## LLM usage on large corpora
+`jta report` saves a **Markdown report** and a JSON companion with full-corpus
+statistics, findings, proposed edits, and investigation coverage. It prints the
+file path to stdout and investigation progress to stderr. Suggested edits are
+never applied automatically.
 
-For **3,000 sessions with 100 turns each**, the two stages have different costs:
+Report generation has three stages:
 
-| Stage | What is sent | Scaling behavior |
-| --- | --- | --- |
-| `analyze` | Context and questions for every uncached session and turn | Work grows with the corpus; unchanged analyses are reused |
-| `report` statistics | Nothing; aggregation and Markdown formatting are local | No model tokens |
-| `report` recommendations | Sampled excerpts, judgments, project files, and the writing prompt | Defaults select up to five categories and three sessions per category, at most 15 distinct sessions |
+1. JTA groups opportunities by **project × category × remediation surface**,
+   computes exact statistics, and chooses the five highest-priority eligible groups.
+2. The selected CLI investigates each group separately. It starts with samples,
+   then can read additional staged sessions and project files, test hypotheses,
+   and look for counterexamples. Findings remain useful even without a proposed edit.
+3. A final CLI invocation reconciles findings, merges overlapping proposals, and
+   ranks recommendations. JTA checks citations, exact file quotations, edit
+   locations, distinct-session support, and conflicting edits before saving.
 
-A fresh analysis asks **2,003 questions per 100-turn session**. At the default
-64-question batch limit, that means **96,000 Jev requests** across 3,000 sessions
-if each full session fits the 48,000-character context threshold. Larger sessions
-use separate outcome and per-turn packets: **303,000 requests**. Both counts
-exclude retries. Each batch repeats context and question instructions, so token
-usage can substantially exceed the size of the original transcripts.
+A recurring proposal needs three distinct supporting sessions by default, within
+one project. If no group qualifies, the default performs a preliminary review
+with a one-session minimum. `--recurring-only` disables that fallback.
 
-Report generation does **not** send all 300,000 turns to the recommendation
-model. But it also has **no total input-token budget**. As an illustration, if
-each sampled session contributes 10,000 tokens, 15 sessions contribute 150,000
-input tokens before the system prompt, response schema, and project files.
-This is an assumption for planning, not a measured token count. `--all` can select
-more sessions and still sends one request. The 6,000-token completion limit applies
-to the entire response, not to each issue.
+```sh
+jta report --top 10                        # Select more project/category groups
+jta report --all                           # All eligible groups, within the budget
+jta report --session <session-id>           # Investigate one session
+jta report --recurring-only                 # Require recurring support
+jta report --refresh                        # Bypass investigation and synthesis caches
+jta report --context src/orchestrator.ts    # Include an explicit project file
+jta report --dry-run --format json          # Inspect selection and contract; no CLI launched
+```
 
-The bundled Humanizer adds 28,696 characters to each request. A validation
-correction resends the original prompt plus the rejected answer; transport retries
-can also repeat requests. Report recommendations are not cached, so generating
-the same report again repeats the model work. `--dry-run --format json` exposes
-the payload without calling a provider, for inspection with that model's tokenizer.
+Initial samples contain up to `max(3, min_pattern_sessions)` supporting sessions,
+plus an additional successful session when available. Agents can retrieve other
+sessions from the filtered project cohort. The report distinguishes initial
+sampling, available evidence, and agent-reported inspection. Broad rubric groups
+are investigation starting points, not proven semantic clusters.
 
-**The report's token tables describe the original agent sessions.** JTA currently
-records recommendation HTTP attempts, but does not retain the provider's token
-usage or calculate its bill. Dollar cost depends on the configured model, actual
-tokenization, output length, and any provider caching. See the
-[full usage assessment](docs/review-assessment.md#llm-token-usage-at-3000-sessions)
-for request arithmetic and the proposed token budgets and caching changes.
+## LLM usage and budgets
+
+Full-corpus statistics are computed locally. A fresh report with five selected
+groups normally runs **five CLI investigations plus one synthesis invocation**.
+Each CLI invocation can contain several model/tool turns. A validation failure
+allows one correction invocation per stage; transport failures are not retried by
+JTA. Invalid results fail the command instead of producing a misleading report.
+
+Defaults limit each invocation to **600 seconds**, cap selection at **20
+investigations**, and cap captured CLI output at 8 MiB. These are wall-clock,
+selection, and output-size limits, **not hard model-token or dollar budgets**.
+Configure them with:
+
+```sh
+jta init --review-timeout-secs 300 --review-max-investigations 10
+jta init --review-model <cli-model-name>     # Optional; otherwise the CLI default
+```
+
+Validated stages are cached against evidence, project snapshots, CLI version,
+backend/model settings, output schema, and instructions. `--refresh` forces a
+new investigation, including after an unpinned model alias changes. Successful
+stages remain reusable if a later stage fails. Cached results are revalidated.
+
+The JSON companion preserves CLI-reported usage, elapsed time, cache status, and
+inspection references per stage. Claude cost values, when returned, are estimates.
+Cached usage belongs to the original execution. **Corpus token tables describe
+the original coding sessions**, not JTA's processing cost.
+
+Jev scoring in `analyze` is unchanged and reuses cached session analyses. See the
+[usage assessment](docs/review-assessment.md) for scoring scale, report budgets,
+and remaining limitations.
 
 ## Know what's happening
 
@@ -131,8 +132,8 @@ scoring. While it runs, the terminal shows:
 - A short result line for each session: scored, cached, or failed.
 
 Failed sessions stay visible while the remaining sessions continue. The final
-summary includes actual API calls and task outcomes. Report generation is quiet;
-its saved report includes provider attempt counts and review notes.
+summary includes actual API calls and task outcomes. Report generation shows investigation and synthesis progress;
+its saved report includes CLI invocation counts, cache status, coverage, and review notes.
 
 Large quantities use readable units such as `3.9B`. The saved JSON companion
 preserves exact values; `--format json` returns
@@ -165,16 +166,16 @@ Project-local `.jta` folders are not automatically used. For explicit storage,
 discovery still targets your current project. This override also loads credentials
 from `/path/to/storage/.env`.
 
-## API keys: set up once
+## Jev authentication: set up once
 
-Run `jta init` to save Jev and your selected review provider's keys in
-`~/.jta/credentials.json`. They work across all your projects. Keys are kept
+Run `jta init` to save the Jev key in
+`~/.jta/credentials.json`. It works across all your projects. Keys are kept
 separate from project configuration and never included in reports or setup JSON.
 The file is unencrypted and readable/writable only by your user on macOS/Linux
 (`0600`). `JTA_HOME` relocates both credentials and project data.
 
 Credential precedence is: **shell environment → project `.env` → saved global key**.
-Custom `--jev-api-key-env` and `--review-api-key-env` names also identify entries
+Custom `--jev-api-key-env` names also identify entries
 in the global file. Rerun `init` to replace a saved key, or remove its entry from
 `credentials.json` to forget it. Setup never sends a key to a provider to test it.
 `--no-input`, JSON output, and redirected input never prompt or save credentials.
@@ -182,9 +183,9 @@ in the global file. Rerun `init` to replace a saved key, or remove its entry fro
 ## What leaves your machine?
 
 Discovery, import, and reading saved reports run locally. `analyze` sends redacted
-session context to Jev; `report` sends selected excerpts and
-relevant project files to your chosen LLM provider when recommendations are enabled.
-Both offer `--dry-run --format json` so you can inspect the payload before sending it. `jta discover` lists matching sessions entirely offline. Redaction helps remove secrets, but inspect sensitive logs before sending.
+session context to Jev; `report` lets the selected agent CLI read staged, redacted session and project
+file snapshots. The CLI sends the material it reads to its configured model service.
+Both offer `--dry-run --format json` to inspect scoring payloads or the report plan before execution. `jta discover` lists matching sessions entirely offline. Redaction helps remove secrets, but inspect sensitive logs before sending.
 Original session logs are never changed.
 
 You can also analyze exported logs with `jta analyze ./sessions/`, filter by agent,
@@ -201,7 +202,7 @@ For an offline sample, run `jta analyze tests/fixtures/public --dry-run` from th
 checkout. The [public fixtures](tests/fixtures/public/README.md) include provenance
 and licensing details.
 
-Development checks require no API credentials:
+Development checks require Python 3 for fake CLI fixtures, and no API credentials:
 
 ```sh
 cargo test --locked

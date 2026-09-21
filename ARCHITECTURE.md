@@ -1,152 +1,107 @@
-# Implementation plan
+# Architecture
 
-Implemented in the shared workspace by three GPT-6 Astra agents at medium effort.
-The root agent owned architecture, interface reviews, public-data acquisition, and
-independent validation. See `VALIDATION.md` for evidence and remaining limits.
+`jta` is a Rust CLI. Discovery, parsing, redaction, aggregation, validation, and
+persistence run locally. Jev supplies categorical judgments; a selected coding
+agent CLI investigates those judgments and proposes improvements.
 
-`jta` is a Rust CLI with a local-first, two-stage analysis pipeline. Transcript
-content is untrusted data: recorded commands are never executed. Explicit imports
-remain supported. Project discovery reads native session metadata and imports only
-matching sessions when the user invokes discovery or no-path analysis.
+## Analysis
 
-## Project discovery extension
+`jta analyze` discovers native Codex and Claude Code sessions for the current
+project, or imports explicit logs. Project identity is the canonical Git checkout
+root (including worktrees), or the current directory outside Git. Source agent
+identity stays `codex` or `claude_code`; sessions are not merged across agents.
 
-Default analysis unit: a Git checkout root (nearest `.git` directory or file), or
-the current directory outside Git. Nested repositories and separate worktrees are
-distinct projects. Canonical paths resolve symlinks; matching uses path components,
-never string prefixes. Keep each session's recorded `repository` cwd and add an
-optional `project_root` (serde default for old evidence). Source `agent` remains
-`codex` or `claude_code`; neither sessions nor tasks are merged across agents.
+Normalized sessions retain events, stable turn IDs, source lines, tool links,
+resource coverage, and warnings. Transcript instructions are untrusted data.
+Redaction precedes persistence and scoring. Revision hashes and configuration
+fingerprints allow unchanged Jev analyses to be reused.
 
-- `jta analyze` with no path discovers both sources for cwd's project and initializes
-  storage in `~/.jta/projects/<name>-<canonical-path-hash>/` if needed. `JTA_HOME`
-  overrides the base; explicit `--workspace DIR` uses `DIR/.jta`. Local `.jta`
-  folders are not searched. Project identity stays independent of storage.
-- `jta discover` lists matching files and source counts offline; no service calls.
-- Discovery supports `--project PATH`, `--agent codex|claude|all`,
-  `--codex-home PATH`, and `--claude-config-dir PATH`. Explicit roots completely
-  replace that source's defaults. Respect CODEX_HOME and CLAUDE_CONFIG_DIR otherwise.
-- Native sources: Codex `sessions/` plus `archived_sessions/`, Claude `projects/`.
-  Read bounded metadata first; only fully parse selected session files. Never match
-  Claude's lossy encoded directory names alone. Exclude helper/subagent transcripts
-  where deterministically identifiable, and expose skipped/malformed counts.
-- Keep explicit `analyze PATH` and `analyze --all` behavior. `--agent` applies to
-  these too. `--project`/source roots are only valid for native discovery.
-- Reports include project and agent breakdowns (sessions, turns, outcomes,
-  verification, resource coverage), and `--agent` filters report/snapshot/review.
-  Patterns retain source-agent counts. Agent comparisons describe observed cohorts,
-  not causal evidence that one agent is better.
-- Testing MUST use existing public fixtures and temporary simulated stores with
-  explicit roots. Never invoke default discovery against the user's actual home.
+`services::prepare_analysis` constructs Jev requests; `score_session` validates
+complete probability distributions before storing results. Short sessions share
+context across question batches; long sessions use bounded outcome/turn packets.
+`analytics` computes exact counts, coverage, confidence exclusions, and patterns.
+These statistics never come from a report agent's prose.
 
-Extension ownership: discovery agent owns `src/discovery.rs`, model/ingestion
-project identity additions, library export and unit tests. Application agent owns
-CLI/workspace behavior and integration tests. Analytics agent owns analytics
-filters/breakdowns, docs, and analytics tests. Root owns architecture and independent
-validation. Reuse the requested GPT-6 Astra / medium agents.
+## Report pipeline
 
-## Tasks and ownership
+1. `cli` loads the filtered scored cohort and computes full-corpus statistics.
+2. `review_pipeline::project_patterns` splits rubric buckets by project before
+   recurrence and priority selection. Default selection is five groups, with a
+   configurable hard cap of twenty investigations.
+3. `Plan::new` creates an initial sample for each selected project/category and
+   supplies the full normalized project cohort for retrieval. `review_context`
+   collects bounded, redacted current instruction, skill, reference, and source
+   file snapshots. One project's file budget does not consume another's.
+4. `review_pipeline::review` runs investigations sequentially. Each agent starts
+   with samples, retrieves more staged evidence as needed, and returns findings
+   and grounded proposals. Findings do not require an edit.
+5. A synthesis invocation reconciles validated investigation results. It can
+   inspect the same staged evidence to resolve contradictions and duplicate edits.
+6. JTA validates the final result and saves proposals plus Markdown/JSON reports.
+   Report generation never applies project edits.
 
-1. **Core:** Cargo scaffolding; shared schema; configuration; deterministic Codex
-   and Claude Code adapters; redaction; evidence and dependency extraction;
-   content-addressed revisions; atomic local persistence. Owner: core agent.
-2. **Services:** verified Jev API adapter; bounded outcome-aware evidence packets;
-   complete categorical probability validation; optional OpenAI/OpenRouter review;
-   mock HTTP tests and error handling. Owner: services agent.
-3. **Application:** CLI command tree; imports and checkpointed scoring; aggregation,
-   pattern selection, review, recommendations, snapshots/comparisons, human labels,
-   calibration, retention; readable and versioned JSON output. Owner: application agent.
-4. **Integration and validation:** public-data acquisition with provenance; integration
-   tests; real API smoke tests using environment credentials; architecture review;
-   installation and compatibility documentation. Owner: root, delegating fixes.
+Every agent invocation gets a temporary working directory containing:
 
-## Shared module contracts
+- `initial.json`: category samples, or validated investigations for synthesis.
+- `manifest.json`: session metadata and original file paths mapped to snapshots.
+- `sessions/*.json`: redacted full normalized sessions and Jev judgments.
+- `files/*.json`: redacted current project text with original paths and hashes.
+- `schema.json`: the required final result schema.
 
-One package `jev-turn-analysis`, library `jta`, binary `jta`. Modules: `model`,
-`config`, `redact`, `ingest`, `store`, `services`, `analytics`, `cli`.
-Use `anyhow::Result`, serde types, tokio/reqwest for HTTP, clap for CLI.
+Paths inside evidence are citation identities. Agents are instructed to read only
+staged files. The runtime enforces read-only tool behavior; the staging directory
+is not represented as a complete filesystem read sandbox. All evidence remains
+untrusted data, including project instruction files.
 
-The core agent owns `model.rs` and `config.rs`, creates them first, and sends concrete
-types to other agents. All agents coordinate interface changes directly.
+## CLI adapters and authentication
 
-Shared domain model (all serializable, cloneable):
+`services/review_cli.rs` starts `codex exec` or `claude --print` directly using
+Tokio processes, without shell interpolation. Codex uses a read-only sandbox and
+ignores user configuration/rules. Claude uses safe mode, preserving login, with
+only Read/Glob/Grep tools. Both disable persistent sessions and customizations for
+these runs. Recent CLI versions supporting the documented flags are required.
 
-- `Session`: `id`, `revision`, `source_path`, `agent`, optional recorded cwd `repository`
-  and normalized `project_root`,
-  `imported_at`, optional `started_at`/`ended_at` (RFC3339 strings), `events`,
-  `turns`, `warnings`, `parser_version`, `redaction_fingerprint`.
-- `Event`: one-based source `line`, `kind`, optional `timestamp`, `text`, optional
-  `tool_name`/`call_id`, optional JSON `input`, optional `is_error`, optional token
-  usage, optional source `message_id`.
-- `Turn`: one-based numeric `id`, `event_indices`, `intent`, `tools`, `commands`,
-  `files_read`, `files_changed`, `errors`, `retry_of`, `candidate_downstream`,
-  `verification`, optional usage and duration. Preserve unknowns rather than zeros.
-- `Distribution`: `selected: String`, `probabilities: BTreeMap<String,f64>`;
-  helper `confidence()` returns selected probability. Shared rubric constants.
-- `Analysis`: `id`, `session_id`, `revision`, `created_at`, `config_fingerprint`,
-  `rubric_version`, `session: BTreeMap<String,Distribution>`,
-  `turns: BTreeMap<u32,TurnJudgment>`, `warnings`, optional service usage.
-- `TurnJudgment`: `answers: BTreeMap<String,Distribution>`,
-  `secondary_opportunities: Vec<String>`, optional `downstream_turn: u32`,
-  `inconsistencies: Vec<String>`.
-- Review/pattern/report/snapshot/label artifacts use application-owned structs or
-  JSON, persisted through generic store methods.
+JTA manages only the Jev key. The agent CLI owns its authentication. Configuration
+contains `review.backend` (`codex` or `claude`), optional `review.model`,
+`review.timeout_secs`, and `review.max_investigations`. Old HTTP review settings
+migrate to CLI defaults on load; `init` persists migration. No review credential
+is resolved, requested, or copied into JTA storage.
 
-Config: `Config { schema_version, jev: JevConfig, review: ReviewConfig,
-redaction: RedactionConfig, retention_days: u32, min_pattern_sessions: usize }`.
-`JevConfig { endpoint, api_key_env, model, max_context_chars: usize,
-max_questions: usize, timeout_secs: u64 }`.
-`ReviewConfig { provider, endpoint, api_key_env, model, timeout_secs: u64 }`;
-provider is a string (`openai`, `openrouter`, or `none`).
-`RedactionConfig { enabled: bool, patterns: Vec<String> }`.
-Never serialize actual credentials. Environment/.env loading is CLI-owned.
+An invocation must exit successfully and return a complete structured result.
+Event streams supply usage and an execution trace. Wall-clock time and captured
+output are bounded; Unix process groups prevent orphan tool processes after
+cancellation or timeout. JTA does not enforce a model-token or dollar budget.
 
-Core public API:
+## Validation and caching
 
-```text
-ingest::import_path(path: &Path, config: &Config) -> Result<Vec<Session>>
-ingest::parse_file(path: &Path, config: &Config) -> Result<Session>
-store::Workspace::init(root: &Path, config: &Config) -> Result<Workspace>
-store::Workspace::discover(explicit: Option<&Path>) -> Result<Workspace>
-store::Workspace::for_project(project: &Path) -> Result<Workspace>
-store::Workspace::open_or_init(explicit: Option<&Path>, project: &Path) -> Result<Workspace>
-Workspace { pub root: PathBuf, /* private data path */ } // root supplies .env and context
-Workspace::data_dir() -> PathBuf // actual per-project or explicit storage location
-Workspace::config() -> Result<Config>
-Workspace::save_session(&Session) -> Result<()>
-Workspace::sessions() -> Result<Vec<Session>> // current revision of each session
-Workspace::session(id: &str, revision: Option<&str>) -> Result<Session>
-Workspace::save_analysis(&Analysis) -> Result<()>
-Workspace::analyses() -> Result<Vec<Analysis>>
-Workspace::save_json<T: Serialize>(collection: &str, id: &str, value: &T) -> Result<()>
-Workspace::load_json<T: DeserializeOwned>(collection: &str, id: &str) -> Result<T>
-Workspace::list_json<T: DeserializeOwned>(collection: &str) -> Result<Vec<T>>
-Workspace::data_dir() -> PathBuf
-config::analysis_fingerprint(&Config) -> String
-```
+The common schema includes summary, themes, findings, recommendations, inspected
+turn references, and inspected file paths. References must exist in the same
+project's staged evidence. Proposal targets and quotations must match current
+snapshots exactly. Recurrence counts distinct sessions supporting each proposal.
+All citations must appear in the agent's inspection record. Overlapping edits
+are rejected. These checks establish traceability, not causal correctness;
+inspection is self-reported.
 
-Services public API (coordinate any refinements):
+Each stage gets at most one correction invocation after local validation failure.
+Execution failures stop immediately. Successful stages are cached independently
+against the evidence, files, configured CLI/model/budgets, CLI version, redaction,
+prompt/schema, and pipeline version. Cache hits are revalidated. `--refresh`
+forces new work; unpinned model alias changes otherwise cannot be detected.
 
-```text
-services::prepare_analysis(session: &Session, config: &Config) -> Result<Vec<Value>>
-services::score_session(session: &Session, config: &Config) -> Result<Analysis> // async
-services::prepare_review(evidence: &Value, config: &Config) -> Result<Value>
-services::review(evidence: &Value, config: &Config) -> Result<Value> // async
-```
+`review_cache/` retains redacted event traces, usage, validated responses, and
+source revisions. Reports separate fresh invocations from historical cached usage.
+`purge` follows source revisions to remove dependent caches and reports.
 
-`prepare_*` never performs network calls or requires credentials. Scoring accepts
-only validated full Jev distributions, never synthetic LLM judgments or heuristics.
-Review returns structured proposals with support references, scope, risk, and
-evaluation plan. CLI validates references against selected evidence before saving.
+## Storage and verification
 
-## Acceptance checks
+Default storage is `~/.jta/projects/<name>-<canonical-path-hash>/`, relocated by
+`JTA_HOME`. An explicit `--workspace DIR` uses `DIR/.jta` without changing native
+discovery's project selection. Credentials are separate in `~/.jta/credentials.json`.
+Persistence is atomic; old revision evidence stays available to snapshots/runs.
 
-- Public Claude Code and Codex logs import deterministically, with provenance.
-- Duplicate content is not counted twice; revisions preserve prior analyses.
-- Malformed records, unknown formats, orphan results and truncation are surfaced.
-- Redaction precedes persistence and remote payloads; .env remains ignored.
-- Tests exercise HTTP contracts without paid calls; real smoke tests are bounded.
-- All README command families work, JSON is pipe-safe, offline commands need no key.
-- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` pass.
-- No automatic harness changes. Validation uses public fixtures and simulated
-  native stores exclusively; no personal session directories are inspected.
+Tests use public fixtures, temporary simulated native stores, Jev HTTP mocks, and
+fake Codex/Claude executables. They do not inspect personal session directories or
+make paid model calls. Python 3 is needed for the fake CLI fixtures.
+
+Required checks: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+and `cargo test --locked`. See `VALIDATION.md` for evidence and remaining limits.
